@@ -110,11 +110,13 @@ func (q *Queue) run() {
 	defer q.queues.Storage.MailExpunge("Outbox") // nolint:errcheck
 
 	// Implement exponential backoff for mobile network stability
+	// Reduced delays for faster retry: 1s, 2s, 4s, 8s, 15s (max)
 	if !q.lastAttempt.IsZero() && q.retryCount > 0 {
-		// Backoff intervals: 5s, 10s, 20s, 40s, 60s (max)
-		backoffSeconds := 5 * (1 << uint(q.retryCount-1))
-		if backoffSeconds > 60 {
-			backoffSeconds = 60
+		var backoffSeconds int
+		if q.retryCount <= 4 {
+			backoffSeconds = 1 << uint(q.retryCount-1) // 1, 2, 4, 8
+		} else {
+			backoffSeconds = 15 // Cap at 15 seconds instead of 60
 		}
 		waitTime := time.Duration(backoffSeconds) * time.Second
 		elapsed := time.Since(q.lastAttempt)
@@ -142,6 +144,38 @@ func (q *Queue) run() {
 			continue
 		}
 
+		// Check if this is a self-send (loopback)
+		myAddress := hex.EncodeToString(q.queues.Config.PublicKey)
+		isSelfSend := q.destination == myAddress
+
+		if isSelfSend {
+			// Local delivery - avoid network connection race condition
+			q.queues.Log.Println("Local delivery from", ref.From, "to", q.destination, "(self-send)")
+
+			// Directly store the mail in the Inbox
+			if _, err := q.queues.Storage.MailCreate("INBOX", mail.Mail); err != nil {
+				q.retryCount++
+				q.queues.Log.Printf("Failed local delivery to %s (retry count: %d): %v\n", q.destination, q.retryCount, err)
+				continue
+			}
+
+			// Remove from queue
+			if err := q.queues.Storage.QueueDeleteDestinationForID(q.destination, ref.ID); err != nil {
+				q.queues.Log.Printf("Failed to remove from queue: %v\n", err)
+			}
+
+			if remaining, err := q.queues.Storage.QueueSelectIsMessagePendingSend("Outbox", ref.ID); err != nil {
+				q.queues.Log.Printf("Failed to check pending: %v\n", err)
+			} else if !remaining {
+				q.queues.Storage.MailDelete("Outbox", ref.ID)
+			}
+
+			q.retryCount = 0
+			q.queues.Log.Println("Local delivery successful from", ref.From, "to", q.destination)
+			continue
+		}
+
+		// Remote delivery via QUIC
 		q.queues.Log.Println("Sending mail from", ref.From, "to", q.destination)
 
 		if err := func() error {

@@ -105,11 +105,13 @@ func NewYggdrasilTransport(log *log.Logger, sk ed25519.PrivateKey, pk ed25519.Pu
 			InsecureSkipVerify: true,
 		},
 		quicConfig: &quic.Config{
-			// Increased timeouts for mobile networks
-			HandshakeIdleTimeout: time.Second * 15,  // 5s -> 15s for slower mobile connections
-			MaxIdleTimeout:       time.Minute * 5,   // 60s -> 5min to maintain connections
-			KeepAlivePeriod:      time.Second * 30,  // Send keepalive every 30s
+			// Optimized timeouts for mobile networks
+			HandshakeIdleTimeout: time.Second * 10,  // 10s handshake timeout (balance speed vs reliability)
+			MaxIdleTimeout:       time.Minute * 3,   // 3min idle timeout (prevent stale connections)
+			KeepAlivePeriod:      time.Second * 20,  // More frequent keepalive for mobile (20s)
 			EnableDatagrams:      false,             // Disable for better reliability
+			MaxIncomingStreams:   100,               // Limit concurrent streams
+			MaxIncomingUniStreams: 100,
 		},
 		transport: &quic.Transport{
 			Conn: ygg,
@@ -134,9 +136,22 @@ func (t *YggdrasilTransport) connectionAcceptLoop() {
 		}
 
 		host := qc.RemoteAddr().String()
-		if eqc, ok := t.sessions.LoadAndDelete(host); ok {
-			eqc := eqc.(quic.Connection)
-			_ = eqc.CloseWithError(0, "Connection replaced")
+		// Check if there's an existing connection and only replace if it's closed/stale
+		if eqc, ok := t.sessions.Load(host); ok {
+			existingConn := eqc.(quic.Connection)
+			// Test if existing connection is still alive by checking context
+			if existingConn.Context().Err() == nil {
+				// Connection is still active, check if it's an outgoing dial
+				if _, isDial := t.dials.Load(host); isDial {
+					// This is an incoming connection but we have an active outgoing dial
+					// Prefer the outgoing connection to avoid breaking active sends
+					_ = qc.CloseWithError(0, "Outgoing connection active")
+					continue
+				}
+			}
+			// Existing connection is dead or no active dial, replace it
+			t.sessions.Delete(host)
+			_ = existingConn.CloseWithError(0, "Connection replaced")
 		}
 		t.sessions.Store(host, qc)
 		if dial, ok := t.dials.LoadAndDelete(host); ok {
@@ -170,6 +185,16 @@ func (t *YggdrasilTransport) Dial(host string) (net.Conn, error) {
 	var retryCount int
 retry:
 	qc, ok := t.sessions.Load(host)
+	if ok {
+		// Validate existing connection is still alive
+		existingConn := qc.(quic.Connection)
+		if existingConn.Context().Err() != nil {
+			// Connection is dead, remove it and create new one
+			t.sessions.Delete(host)
+			ok = false
+		}
+	}
+
 	if !ok {
 		if dial, ok := t.dials.Load(host); ok {
 			<-dial.(*yggdrasilDial).Done()
@@ -203,10 +228,10 @@ retry:
 		qc := qc.(quic.Connection)
 		qs, err := qc.OpenStreamSync(ctx)
 		if err != nil {
-			// Retry up to 3 times with exponential backoff
-			if retryCount < 3 {
+			// Retry up to 5 times with exponential backoff (increased for mobile reliability)
+			if retryCount < 5 {
 				retryCount++
-				// Exponential backoff: 100ms, 200ms, 400ms
+				// Exponential backoff: 100ms, 200ms, 400ms, 800ms, 1600ms
 				backoff := time.Millisecond * time.Duration(100<<uint(retryCount-1))
 				time.Sleep(backoff)
 
