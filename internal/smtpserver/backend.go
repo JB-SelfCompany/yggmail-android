@@ -29,12 +29,18 @@ const (
 )
 
 type Backend struct {
-	Mode    BackendMode
-	Log     *log.Logger
-	Config  *config.Config
-	Queues  *smtpsender.Queues
-	Storage storage.Storage
-	Notify  *imapserver.IMAPNotify
+	Mode         BackendMode
+	Log          *log.Logger
+	Config       *config.Config
+	Queues       *smtpsender.Queues
+	Storage      storage.Storage
+	Notify       *imapserver.IMAPNotify
+	MailCallback MailCallback
+}
+
+// MailCallback interface for mail event notifications
+type MailCallback interface {
+	OnNewMail(from string, mailID int)
 }
 
 func (b *Backend) Login(state *smtp.ConnectionState, username, password string) (smtp.Session, error) {

@@ -83,6 +83,11 @@ func (s *SessionRemote) Data(r io.Reader) error {
 				s.backend.Log.Println("Failed to notify:", s.from)
 			}
 		}
+
+		// Trigger mail callback to notify mobile app
+		if s.backend.MailCallback != nil {
+			s.backend.MailCallback.OnNewMail(s.from, id)
+		}
 	}
 
 	return nil

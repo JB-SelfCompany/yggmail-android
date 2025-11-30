@@ -47,21 +47,46 @@ func (ext *IMAPNotify) Command(name string) server.HandlerFactory {
 }
 
 func (ext *IMAPNotify) NotifyNew(id, count int) error {
+	// Skip logging for heartbeat messages (id == -1)
+	isHeartbeat := id == -1
+
+	if !isHeartbeat {
+		ext.log.Printf("NotifyNew called: mailID=%d, totalCount=%d", id, count)
+	}
+
 	ext.server.ForEachConn(func(c server.Conn) {
-		var resptype imap.StatusRespType
+		// Check if client is in INBOX and send EXISTS/RECENT untagged responses
 		if mailbox := c.Context().Mailbox; mailbox != nil && mailbox.Name() == "INBOX" {
-			resptype = imap.StatusRespType(
-				fmt.Sprintf("EXISTS %d", id),
-			)
+			if !isHeartbeat {
+				ext.log.Printf("Sending untagged EXISTS %d to IDLE client in INBOX", count)
+			}
+
+			// Send untagged EXISTS response (total message count)
+			_ = c.WriteResp(&imap.StatusResp{
+				Type: imap.StatusRespType(fmt.Sprintf("%d EXISTS", count)),
+			})
+
+			// Only send RECENT for actual new mail, not heartbeats
+			if !isHeartbeat {
+				// Send untagged RECENT response
+				_ = c.WriteResp(&imap.StatusResp{
+					Type: imap.StatusRespType(fmt.Sprintf("%d RECENT", 1)),
+				})
+			}
 		} else {
-			resptype = imap.StatusRespType(
-				fmt.Sprintf("STATUS INBOX (UIDNEXT %d MESSAGES %d)", id+1, count),
-			)
+			// For clients not currently in INBOX, send STATUS notification
+			if !isHeartbeat {
+				ext.log.Printf("Sending STATUS notification to client not in INBOX")
+			}
+			_ = c.WriteResp(&imap.StatusResp{
+				Type: imap.StatusRespType(fmt.Sprintf("STATUS INBOX (UIDNEXT %d MESSAGES %d)", id+1, count)),
+			})
 		}
-		_ = c.WriteResp(&imap.StatusResp{
-			Type: resptype,
-		})
 	})
+
+	if !isHeartbeat {
+		ext.log.Println("NotifyNew completed successfully")
+	}
 	return nil
 }
 

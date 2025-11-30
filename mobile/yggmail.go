@@ -84,6 +84,12 @@ type YggmailService struct {
 	serversPaused     bool
 	idleCheckTicker   *time.Ticker
 	idleCheckDone     chan struct{}
+	// Heartbeat mechanism for keeping IMAP IDLE connections active
+	heartbeatTicker   *time.Ticker
+	heartbeatDone     chan struct{}
+	heartbeatInterval time.Duration
+	isActive          bool // Track if user is actively using the app
+	lastMailActivity  time.Time
 }
 
 // NewYggmailService creates a new instance of Yggmail service
@@ -102,16 +108,20 @@ func NewYggmailService(databasePath, smtpAddr, imapAddr string) (*YggmailService
 	}
 
 	service := &YggmailService{
-		databasePath:    databasePath,
-		smtpAddr:        smtpAddr,
-		imapAddr:        imapAddr,
-		stopChan:        make(chan struct{}),
-		smtpDone:        make(chan struct{}),
-		overlayDone:     make(chan struct{}),
-		idleCheckDone:   make(chan struct{}),
-		idleTimeout:     10 * time.Minute, // 10 minutes idle timeout for battery optimization
-		lastActivity:    time.Now(),
-		serversPaused:   false,
+		databasePath:      databasePath,
+		smtpAddr:          smtpAddr,
+		imapAddr:          imapAddr,
+		stopChan:          make(chan struct{}),
+		smtpDone:          make(chan struct{}),
+		overlayDone:       make(chan struct{}),
+		idleCheckDone:     make(chan struct{}),
+		heartbeatDone:     make(chan struct{}),
+		idleTimeout:       10 * time.Minute, // 10 minutes idle timeout for battery optimization
+		lastActivity:      time.Now(),
+		lastMailActivity:  time.Now(),
+		serversPaused:     false,
+		heartbeatInterval: 30 * time.Second, // Start with conservative 30 seconds
+		isActive:          true,
 	}
 
 	// Initialize custom logger
@@ -276,6 +286,8 @@ func (s *YggmailService) Start(peers string, enableMulticast bool, multicastRege
 	// Start overlay SMTP server (for Yggdrasil network)
 	go s.startOverlaySMTP()
 
+	s.logger.Println("Mail notification callbacks configured")
+
 	// Store connection parameters for potential reconnection
 	s.lastPeers = peers
 	s.lastMulticast = enableMulticast
@@ -286,6 +298,10 @@ func (s *YggmailService) Start(peers string, enableMulticast bool, multicastRege
 	s.serversPaused = false
 	s.idleCheckDone = make(chan struct{})
 	go s.idleTimeoutChecker()
+
+	// Start heartbeat to keep IMAP IDLE connections alive
+	s.heartbeatDone = make(chan struct{})
+	go s.heartbeatSender()
 
 	s.running = true
 	s.logger.Println("Yggmail service started successfully")
@@ -326,17 +342,33 @@ func (s *YggmailService) startLocalSMTP() {
 	s.logger.Println("Local SMTP server stopped")
 }
 
+// mailCallbackAdapter adapts the mobile MailCallback to the internal callback interface
+type mailCallbackAdapter struct {
+	service *YggmailService
+}
+
+func (a *mailCallbackAdapter) OnNewMail(from string, mailID int) {
+	// Record mail activity for aggressive heartbeat mode
+	a.service.RecordMailActivity()
+
+	if a.service.mailCallback != nil {
+		// Extract mailbox name and get mail details
+		a.service.mailCallback.OnNewMail("INBOX", from, "", int(mailID))
+	}
+}
+
 // startOverlaySMTP starts the overlay SMTP server for Yggdrasil network
 func (s *YggmailService) startOverlaySMTP() {
 	defer close(s.overlayDone)
 
 	overlayBackend := &smtpserver.Backend{
-		Log:     s.logger,
-		Mode:    smtpserver.BackendModeExternal,
-		Config:  s.config,
-		Storage: s.storage,
-		Queues:  s.queues,
-		Notify:  s.imapNotify,
+		Log:          s.logger,
+		Mode:         smtpserver.BackendModeExternal,
+		Config:       s.config,
+		Storage:      s.storage,
+		Queues:       s.queues,
+		Notify:       s.imapNotify,
+		MailCallback: &mailCallbackAdapter{service: s},
 	}
 
 	s.overlaySMTP = smtp.NewServer(overlayBackend)
@@ -369,6 +401,12 @@ func (s *YggmailService) Stop() error {
 	close(s.idleCheckDone)
 	if s.idleCheckTicker != nil {
 		s.idleCheckTicker.Stop()
+	}
+
+	// Stop heartbeat sender
+	close(s.heartbeatDone)
+	if s.heartbeatTicker != nil {
+		s.heartbeatTicker.Stop()
 	}
 
 	// Close IMAP server first
@@ -554,8 +592,8 @@ func (s *YggmailService) SendMail(from, to, subject, body string) error {
 
 	s.logger.Printf("Mail queued for sending to %s\n", to)
 
-	// Record activity for idle timeout
-	s.RecordActivity()
+	// Record mail activity for aggressive delivery mode
+	s.RecordMailActivity()
 
 	if s.mailCallback != nil {
 		s.mailCallback.OnMailSent(to, subject)
@@ -895,13 +933,40 @@ func (s *YggmailService) RecordActivity() {
 	defer s.mu.Unlock()
 
 	s.lastActivity = time.Now()
-	s.logger.Println("Activity recorded, idle timeout reset")
+	// Note: We don't log here to reduce log spam from periodic polling
 
 	// Resume servers if they were paused
 	if s.serversPaused && s.running {
 		s.logger.Println("Resuming servers due to activity")
 		// Servers will be resumed by the idle checker on next tick
 		s.serversPaused = false
+	}
+}
+
+// RecordMailActivity records mail-related activity (send/receive)
+// This triggers more aggressive heartbeat for immediate delivery
+func (s *YggmailService) RecordMailActivity() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.lastActivity = time.Now()
+	s.lastMailActivity = time.Now()
+	s.logger.Println("Mail activity recorded, switching to aggressive mode")
+}
+
+// SetActive sets whether the app is in active/foreground mode
+// Active mode uses more frequent heartbeats for better responsiveness
+func (s *YggmailService) SetActive(active bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.isActive != active {
+		s.isActive = active
+		if active {
+			s.logger.Println("App became active, increasing heartbeat frequency")
+		} else {
+			s.logger.Println("App became inactive, will reduce heartbeat frequency")
+		}
 	}
 }
 
@@ -968,6 +1033,98 @@ func (s *YggmailService) checkIdleState() {
 	// - Reduce QUIC keepalive frequency
 	// - Pause queue manager checks
 	// - Reduce multicast announcements
+}
+
+// heartbeatSender periodically sends IMAP IDLE notifications to keep connections alive
+// Uses adaptive intervals based on activity level for battery optimization
+func (s *YggmailService) heartbeatSender() {
+	s.mu.Lock()
+	interval := s.heartbeatInterval
+	s.mu.Unlock()
+
+	s.heartbeatTicker = time.NewTicker(interval)
+	defer s.heartbeatTicker.Stop()
+
+	s.logger.Printf("IMAP heartbeat sender started (adaptive mode, initial: %v)", interval)
+
+	lastCheck := time.Now()
+
+	for {
+		select {
+		case <-s.heartbeatTicker.C:
+			s.sendHeartbeat()
+
+			// Adaptively adjust heartbeat interval based on activity
+			// Check every minute if we should adjust
+			if time.Since(lastCheck) >= time.Minute {
+				lastCheck = time.Now()
+				newInterval := s.calculateAdaptiveInterval()
+
+				s.mu.Lock()
+				if newInterval != s.heartbeatInterval {
+					s.heartbeatInterval = newInterval
+					s.heartbeatTicker.Reset(newInterval)
+					s.logger.Printf("Heartbeat interval adjusted to %v", newInterval)
+				}
+				s.mu.Unlock()
+			}
+
+		case <-s.heartbeatDone:
+			s.logger.Println("IMAP heartbeat sender stopped")
+			return
+		}
+	}
+}
+
+// calculateAdaptiveInterval determines optimal heartbeat interval based on activity
+func (s *YggmailService) calculateAdaptiveInterval() time.Duration {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	timeSinceMailActivity := time.Since(s.lastMailActivity)
+	timeSinceActivity := time.Since(s.lastActivity)
+
+	// Aggressive mode: Recent mail activity (< 2 minutes)
+	if timeSinceMailActivity < 2*time.Minute {
+		return 5 * time.Second
+	}
+
+	// Active mode: Recent app activity (< 5 minutes)
+	if timeSinceActivity < 5*time.Minute || s.isActive {
+		return 15 * time.Second
+	}
+
+	// Idle mode: Some activity (< 15 minutes)
+	if timeSinceActivity < 15*time.Minute {
+		return 30 * time.Second
+	}
+
+	// Deep idle mode: No activity for long time
+	// Still need heartbeat but can be very infrequent
+	return 60 * time.Second
+}
+
+// sendHeartbeat sends a lightweight notification to IMAP IDLE clients
+func (s *YggmailService) sendHeartbeat() {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if !s.running || s.imapNotify == nil {
+		return
+	}
+
+	// Get current mail count for INBOX
+	count, err := s.storage.MailCount("INBOX")
+	if err != nil {
+		// Silently ignore errors to avoid log spam
+		return
+	}
+
+	// Send lightweight status update to IMAP IDLE clients
+	// This keeps the connection active and ensures notifications are delivered
+	// Note: We use count of -1 as a special "heartbeat" signal to avoid creating
+	// false "new mail" notifications in the logs
+	_ = s.imapNotify.NotifyNew(-1, count)
 }
 
 // logWriter is a custom writer that forwards logs to the callback

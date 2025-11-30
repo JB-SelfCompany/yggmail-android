@@ -30,6 +30,7 @@ type Queues struct {
 	Transport transport.Transport
 	Storage   storage.Storage
 	queues    sync.Map // servername -> *Queue
+	triggerCh chan struct{} // Channel to trigger immediate queue processing
 }
 
 func NewQueues(config *config.Config, log *log.Logger, transport transport.Transport, storage storage.Storage) *Queues {
@@ -38,6 +39,7 @@ func NewQueues(config *config.Config, log *log.Logger, transport transport.Trans
 		Log:       log,
 		Transport: transport,
 		Storage:   storage,
+		triggerCh: make(chan struct{}, 1), // Buffered channel to avoid blocking
 	}
 	time.AfterFunc(time.Second*5, qs.manager)
 	return qs
@@ -77,6 +79,14 @@ func (qs *Queues) QueueFor(from string, rcpts []string, content []byte) error {
 		}
 
 		_, _ = qs.queueFor(host)
+	}
+
+	// Trigger immediate queue processing for faster delivery
+	select {
+	case qs.triggerCh <- struct{}{}:
+		// Successfully triggered immediate processing
+	default:
+		// Channel already has a trigger pending, skip
 	}
 
 	return nil
