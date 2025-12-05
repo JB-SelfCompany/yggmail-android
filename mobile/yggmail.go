@@ -17,6 +17,7 @@ import (
 	"io"
 	"log"
 	"net/mail"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -31,6 +32,7 @@ import (
 	"github.com/neilalexander/yggmail/internal/storage/sqlite3"
 	"github.com/neilalexander/yggmail/internal/transport"
 	"github.com/neilalexander/yggmail/internal/utils"
+	"golang.org/x/crypto/bcrypt"
 )
 
 // LogCallback interface for Android logging
@@ -530,7 +532,15 @@ func (s *YggmailService) SetPassword(password string) error {
 		return fmt.Errorf("service not initialized")
 	}
 
-	if err := storage.ConfigSetPassword(strings.TrimSpace(password)); err != nil {
+	// Hash the password with bcrypt
+	trimmedPassword := strings.TrimSpace(password)
+	hash, err := bcrypt.GenerateFromPassword([]byte(trimmedPassword), bcrypt.DefaultCost)
+	if err != nil {
+		return fmt.Errorf("failed to hash password: %w", err)
+	}
+
+	// Store the hashed password
+	if err := storage.ConfigSetPassword(string(hash)); err != nil {
 		return fmt.Errorf("failed to set password: %w", err)
 	}
 
@@ -689,6 +699,22 @@ type MailInfo struct {
 	Seen     bool
 	Flagged  bool
 	Answered bool
+}
+
+// PeerConnectionInfo represents information about a connected peer
+// This is a gomobile-compatible version of core.PeerInfo
+type PeerConnectionInfo struct {
+	URI           string  // Peer URI (e.g., "tls://example.com:12345")
+	Up            bool    // Whether the connection is up
+	Inbound       bool    // Whether this is an inbound connection
+	LastError     string  // Last error message (empty if no error)
+	Key           string  // Peer's public key (hex encoded)
+	Uptime        int64   // Connection uptime in seconds
+	LatencyMs     int64   // Round-trip latency in milliseconds
+	RXBytes       int64   // Total bytes received
+	TXBytes       int64   // Total bytes transmitted
+	RXRate        int64   // Current receive rate (bytes/sec)
+	TXRate        int64   // Current transmit rate (bytes/sec)
 }
 
 // GetMailList returns list of mails in a mailbox
@@ -1125,6 +1151,178 @@ func (s *YggmailService) sendHeartbeat() {
 	// Note: We use count of -1 as a special "heartbeat" signal to avoid creating
 	// false "new mail" notifications in the logs
 	_ = s.imapNotify.NotifyNew(-1, count)
+}
+
+// GetPeerConnections returns information about all connected peers
+// Returns nil if service is not running or transport is not initialized
+func (s *YggmailService) GetPeerConnections() []*PeerConnectionInfo {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if !s.running || s.transport == nil {
+		return nil
+	}
+
+	// Get peer information from yggdrasil core
+	corePeers := s.transport.GetPeers()
+	if corePeers == nil {
+		return nil
+	}
+
+	// Convert to gomobile-compatible format
+	peers := make([]*PeerConnectionInfo, 0, len(corePeers))
+	for _, peer := range corePeers {
+		info := &PeerConnectionInfo{
+			URI:       peer.URI,
+			Up:        peer.Up,
+			Inbound:   peer.Inbound,
+			Key:       hex.EncodeToString(peer.Key),
+			Uptime:    int64(peer.Uptime.Seconds()),
+			LatencyMs: int64(peer.Latency.Milliseconds()),
+			RXBytes:   int64(peer.RXBytes),
+			TXBytes:   int64(peer.TXBytes),
+			RXRate:    int64(peer.RXRate),
+			TXRate:    int64(peer.TXRate),
+		}
+		if peer.LastError != nil {
+			info.LastError = peer.LastError.Error()
+		}
+		peers = append(peers, info)
+	}
+
+	return peers
+}
+
+// GetPeerConnectionsJSON returns peer connection information as JSON string
+// Returns empty array if no transport available
+// Deprecated: Use GetPeerConnections() instead for better type safety
+func (s *YggmailService) GetPeerConnectionsJSON() string {
+	peers := s.GetPeerConnections()
+	if peers == nil || len(peers) == 0 {
+		return "[]"
+	}
+
+	// Manually build JSON to avoid external dependencies
+	var sb strings.Builder
+	sb.WriteString("[")
+	for i, peer := range peers {
+		if i > 0 {
+			sb.WriteString(",")
+		}
+		sb.WriteString("{")
+		sb.WriteString(fmt.Sprintf("\"uri\":\"%s\",", peer.URI))
+		sb.WriteString(fmt.Sprintf("\"up\":%t,", peer.Up))
+		sb.WriteString(fmt.Sprintf("\"inbound\":%t,", peer.Inbound))
+		sb.WriteString(fmt.Sprintf("\"lastError\":\"%s\",", peer.LastError))
+		sb.WriteString(fmt.Sprintf("\"key\":\"%s\",", peer.Key))
+		sb.WriteString(fmt.Sprintf("\"uptime\":%d,", peer.Uptime))
+		sb.WriteString(fmt.Sprintf("\"latencyMs\":%d,", peer.LatencyMs))
+		sb.WriteString(fmt.Sprintf("\"rxBytes\":%d,", peer.RXBytes))
+		sb.WriteString(fmt.Sprintf("\"txBytes\":%d,", peer.TXBytes))
+		sb.WriteString(fmt.Sprintf("\"rxRate\":%d,", peer.RXRate))
+		sb.WriteString(fmt.Sprintf("\"txRate\":%d", peer.TXRate))
+		sb.WriteString("}")
+	}
+	sb.WriteString("]")
+	return sb.String()
+}
+
+// UpdatePeers updates peer configuration without restarting the service
+// Uses Yggdrasil Core's AddPeer/RemovePeer methods for live updates
+func (s *YggmailService) UpdatePeers(peers string, enableMulticast bool, multicastRegex string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if !s.running || s.transport == nil {
+		return fmt.Errorf("service not running or transport not initialized")
+	}
+
+	s.logger.Println("UpdatePeers called - applying live peer configuration changes...")
+
+	// Parse new peer list
+	var newPeerList []string
+	if peers != "" {
+		for _, p := range strings.Split(peers, ",") {
+			p = strings.TrimSpace(p)
+			if p != "" {
+				newPeerList = append(newPeerList, p)
+			}
+		}
+	}
+
+	// Parse old peer list
+	var oldPeerList []string
+	if s.lastPeers != "" {
+		for _, p := range strings.Split(s.lastPeers, ",") {
+			p = strings.TrimSpace(p)
+			if p != "" {
+				oldPeerList = append(oldPeerList, p)
+			}
+		}
+	}
+
+	// Get Yggdrasil Core for peer management
+	core := s.transport.GetCore()
+	if core == nil {
+		return fmt.Errorf("failed to get Yggdrasil core")
+	}
+
+	// Remove peers that are no longer in the new list
+	for _, oldPeer := range oldPeerList {
+		found := false
+		for _, newPeer := range newPeerList {
+			if oldPeer == newPeer {
+				found = true
+				break
+			}
+		}
+		if !found {
+			// Parse URI and remove peer
+			u, err := url.Parse(oldPeer)
+			if err != nil {
+				s.logger.Printf("Warning: failed to parse old peer URI %s: %v\n", oldPeer, err)
+				continue
+			}
+			if err := core.RemovePeer(u, ""); err != nil {
+				s.logger.Printf("Warning: failed to remove peer %s: %v\n", oldPeer, err)
+			} else {
+				s.logger.Printf("Removed peer: %s\n", oldPeer)
+			}
+		}
+	}
+
+	// Add new peers that weren't in the old list
+	for _, newPeer := range newPeerList {
+		found := false
+		for _, oldPeer := range oldPeerList {
+			if newPeer == oldPeer {
+				found = true
+				break
+			}
+		}
+		if !found {
+			// Parse URI and add peer
+			u, err := url.Parse(newPeer)
+			if err != nil {
+				s.logger.Printf("Warning: failed to parse new peer URI %s: %v\n", newPeer, err)
+				continue
+			}
+			if err := core.AddPeer(u, ""); err != nil {
+				s.logger.Printf("Warning: failed to add peer %s: %v\n", newPeer, err)
+			} else {
+				s.logger.Printf("Added peer: %s\n", newPeer)
+			}
+		}
+	}
+
+	// Store new configuration
+	s.lastPeers = peers
+	s.lastMulticast = enableMulticast
+	s.lastMulticastRegex = multicastRegex
+
+	s.logger.Printf("Peer configuration updated successfully: %d peers configured\n", len(newPeerList))
+
+	return nil
 }
 
 // logWriter is a custom writer that forwards logs to the callback

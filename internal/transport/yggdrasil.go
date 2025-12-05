@@ -28,6 +28,7 @@ import (
 
 type YggdrasilTransport struct {
 	yggquic *yggquic.YggdrasilTransport
+	core    *core.Core
 }
 
 func NewYggdrasilTransport(log *log.Logger, sk ed25519.PrivateKey, pk ed25519.PublicKey, peers []string, mcast bool, mcastregexp string) (*YggdrasilTransport, error) {
@@ -89,13 +90,14 @@ func NewYggdrasilTransport(log *log.Logger, sk ed25519.PrivateKey, pk ed25519.Pu
 		InitialPacketSize: 512, // Small packets = less buffering delay
 	}
 
-	yq, err := yggquic.New(ygg, quicConfig)
+	yq, err := yggquic.New(ygg, *cfg.Certificate, quicConfig, 300)
 	if err != nil {
 		panic(err)
 	}
 
 	return &YggdrasilTransport{
 		yggquic: yq,
+		core:    ygg,
 	}, nil
 }
 
@@ -116,4 +118,17 @@ func (t *YggdrasilTransport) Dial(host string) (net.Conn, error) {
 
 func (t *YggdrasilTransport) Listener() net.Listener {
 	return t.yggquic
+}
+
+// GetCore returns the underlying Yggdrasil core for peer management
+func (t *YggdrasilTransport) GetCore() *core.Core {
+	return t.core
+}
+
+// GetPeers returns information about all connected peers
+func (t *YggdrasilTransport) GetPeers() []core.PeerInfo {
+	if t.core == nil {
+		return nil
+	}
+	return t.core.GetPeers()
 }
