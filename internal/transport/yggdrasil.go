@@ -27,9 +27,13 @@ import (
 )
 
 type YggdrasilTransport struct {
-	yggquic *yggquic.YggdrasilTransport
-	core    *core.Core
+	yggquic              *yggquic.YggdrasilTransport
+	core                 *core.Core
+	peerDiscoveryHandler PeerDiscoveryHandler
 }
+
+// PeerDiscoveryHandler is called when a new peer is discovered
+type PeerDiscoveryHandler func(peerURI string)
 
 func NewYggdrasilTransport(log *log.Logger, sk ed25519.PrivateKey, pk ed25519.PublicKey, peers []string, mcast bool, mcastregexp string) (*YggdrasilTransport, error) {
 	yellow := color.New(color.FgYellow).SprintfFunc()
@@ -131,4 +135,33 @@ func (t *YggdrasilTransport) GetPeers() []core.PeerInfo {
 		return nil
 	}
 	return t.core.GetPeers()
+}
+
+// SetPeerDiscoveryHandler sets the handler to be called when new peers are discovered
+func (t *YggdrasilTransport) SetPeerDiscoveryHandler(handler PeerDiscoveryHandler) {
+	t.peerDiscoveryHandler = handler
+}
+
+// MonitorPeers monitors for new peer connections and calls the discovery handler
+// Should be called periodically (e.g., every 5 seconds) by the service
+func (t *YggdrasilTransport) MonitorPeers(knownPeers map[string]bool) {
+	if t.peerDiscoveryHandler == nil {
+		return
+	}
+
+	peers := t.GetPeers()
+	for _, peer := range peers {
+		// Check if this is a new peer we haven't seen before
+		if !knownPeers[peer.URI] {
+			// Mark as known
+			knownPeers[peer.URI] = true
+
+			// Only report inbound peers (multicast-discovered from local network)
+			// Outbound peers are configured statically and shouldn't be reported as "discovered"
+			if peer.Inbound {
+				// Notify about the discovery
+				t.peerDiscoveryHandler(peer.URI)
+			}
+		}
+	}
 }
