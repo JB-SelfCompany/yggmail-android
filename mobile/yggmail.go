@@ -374,8 +374,16 @@ func (s *YggmailService) startOverlaySMTP() {
 	s.logger.Println("Overlay SMTP server stopped")
 }
 
-// Stop stops the Yggmail service
-func (s *YggmailService) Stop() error {
+// Stop stops the Yggmail service with graceful shutdown and panic recovery
+func (s *YggmailService) Stop() (err error) {
+	// Recover from any panics during shutdown
+	defer func() {
+		if r := recover(); r != nil {
+			s.logger.Printf("PANIC during Stop(): %v\n", r)
+			err = fmt.Errorf("panic during shutdown: %v", r)
+		}
+	}()
+
 	s.mu.Lock()
 
 	if !s.running {
@@ -388,54 +396,85 @@ func (s *YggmailService) Stop() error {
 	// Mark as not running to prevent new requests
 	s.running = false
 
-	// Stop idle timeout checker
-	close(s.idleCheckDone)
+	// Step 1: Stop background goroutines first (non-blocking)
+	// Close channels to signal goroutines to exit
+	safeClose := func(ch chan struct{}, name string) {
+		defer func() {
+			if r := recover(); r != nil {
+				s.logger.Printf("Warning: panic closing %s channel: %v\n", name, r)
+			}
+		}()
+		select {
+		case <-ch:
+			// Already closed
+		default:
+			close(ch)
+		}
+	}
+
+	safeClose(s.idleCheckDone, "idleCheck")
 	if s.idleCheckTicker != nil {
 		s.idleCheckTicker.Stop()
 	}
 
-	// Stop heartbeat sender
-	close(s.heartbeatDone)
+	safeClose(s.heartbeatDone, "heartbeat")
 	if s.heartbeatTicker != nil {
 		s.heartbeatTicker.Stop()
 	}
 
-	// Close IMAP server first
+	// Give background goroutines time to exit cleanly
+	time.Sleep(100 * time.Millisecond)
+
+	// Step 2: Close servers in order (IMAP first, then SMTP, then transport)
+	// IMAP server - now has proper shutdown with goroutine wait
 	if s.imapServer != nil {
+		s.logger.Println("Closing IMAP server...")
 		if err := s.imapServer.Close(); err != nil {
 			s.logger.Printf("Error closing IMAP server: %v\n", err)
+		} else {
+			s.logger.Println("IMAP server closed successfully")
 		}
 	}
 
-	// Close local SMTP server
+	// Local SMTP server
 	if s.localSMTP != nil {
+		s.logger.Println("Closing local SMTP server...")
 		if err := s.localSMTP.Close(); err != nil {
 			s.logger.Printf("Error closing local SMTP: %v\n", err)
+		} else {
+			s.logger.Println("Local SMTP server closed successfully")
 		}
 	}
 
-	// Close overlay SMTP server
+	// Overlay SMTP server
 	if s.overlaySMTP != nil {
+		s.logger.Println("Closing overlay SMTP server...")
 		if err := s.overlaySMTP.Close(); err != nil {
 			s.logger.Printf("Error closing overlay SMTP: %v\n", err)
+		} else {
+			s.logger.Println("Overlay SMTP server closed successfully")
 		}
 	}
 
-	// Close transport (this will unblock overlay SMTP)
+	// Transport (closes the Yggdrasil listener, unblocking overlay SMTP)
 	if s.transport != nil {
+		s.logger.Println("Closing transport...")
 		if err := s.transport.Listener().Close(); err != nil {
 			s.logger.Printf("Error closing transport: %v\n", err)
+		} else {
+			s.logger.Println("Transport closed successfully")
 		}
 	}
 
-	// Signal stop
-	close(s.stopChan)
+	// Step 3: Signal stop to any remaining goroutines
+	safeClose(s.stopChan, "stop")
 
 	// Unlock before waiting to allow servers to finish
 	s.mu.Unlock()
 
-	// Wait for servers to fully stop with timeout
-	timeout := time.NewTimer(5 * time.Second)
+	// Step 4: Wait for server goroutines to fully stop with timeout
+	s.logger.Println("Waiting for server goroutines to exit...")
+	timeout := time.NewTimer(3 * time.Second)
 	defer timeout.Stop()
 
 	smtpStopped := false
@@ -446,16 +485,17 @@ func (s *YggmailService) Stop() error {
 		case _, ok := <-s.smtpDone:
 			if ok || !smtpStopped {
 				smtpStopped = true
-				s.logger.Println("Local SMTP server fully stopped")
+				s.logger.Println("Local SMTP goroutine exited")
 			}
 		case _, ok := <-s.overlayDone:
 			if ok || !overlayStopped {
 				overlayStopped = true
-				s.logger.Println("Overlay SMTP server fully stopped")
+				s.logger.Println("Overlay SMTP goroutine exited")
 			}
 		case <-timeout.C:
-			s.logger.Println("Warning: Timeout waiting for servers to stop")
-			return nil
+			s.logger.Println("Warning: Timeout waiting for server goroutines (continuing anyway)")
+			smtpStopped = true
+			overlayStopped = true
 		}
 	}
 
