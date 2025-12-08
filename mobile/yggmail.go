@@ -911,6 +911,29 @@ func (s *YggmailService) GetIMAPAddress() string {
 	return s.imapAddr
 }
 
+// OnPeerConnectionChange should be called when peer connections change
+// This resets retry counters to allow immediate delivery attempts with new peers
+func (s *YggmailService) OnPeerConnectionChange() {
+	s.mu.RLock()
+	running := s.running
+	s.mu.RUnlock()
+
+	if !running {
+		return
+	}
+
+	s.logger.Println("Peer connection change detected, resetting retry counters...")
+
+	// Reset retry counters to allow immediate delivery attempts
+	if s.queues != nil {
+		s.queues.ResetRetryCounters()
+	}
+
+	if s.connCallback != nil {
+		s.connCallback.OnConnected("peer_change")
+	}
+}
+
 // OnNetworkChange should be called when network connectivity changes (WiFi <-> Mobile)
 // This helps maintain stable connections on mobile devices
 func (s *YggmailService) OnNetworkChange() error {
@@ -952,6 +975,8 @@ func (s *YggmailService) OnNetworkChange() error {
 	// Update queues with new transport
 	if s.queues != nil {
 		s.queues.Transport = newTransport
+		// Reset retry counters to allow immediate delivery attempts
+		s.queues.ResetRetryCounters()
 	}
 	s.mu.Unlock()
 

@@ -30,11 +30,12 @@ import (
 )
 
 const (
-	// Battery-optimized retry strategy
-	MAX_RETRY_ATTEMPTS   = 10  // Maximum 10 retries before giving up
-	MIN_BACKOFF_SECONDS  = 5   // Start at 5 seconds
-	MAX_BACKOFF_SECONDS  = 300 // Cap at 5 minutes
-	BACKOFF_MULTIPLIER   = 2.0 // Exponential growth factor
+	// Battery-optimized retry strategy with long delays for mobile networks
+	// Retries at: 30, 90, 210, 450, 930, 1890, 3810, 5730, 7650, 9570 seconds from start
+	MIN_BACKOFF_SECONDS        = 30   // Start at 30 seconds
+	MAX_BACKOFF_SECONDS        = 1920 // Cap at 32 minutes
+	BACKOFF_MULTIPLIER         = 2.0  // Exponential growth factor
+	UNDELIVERABLE_TIMEOUT_SECS = 604800 // 7 days - report as undeliverable after this time
 )
 
 type Queues struct {
@@ -120,6 +121,28 @@ func (qs *Queues) queueFor(server string) (*Queue, error) {
 	return q, nil
 }
 
+// ResetRetryCounters clears all retry counters and triggers immediate queue processing
+// This should be called when network conditions change (WiFi <-> Mobile) or peer connections change
+func (qs *Queues) ResetRetryCounters() {
+	qs.Log.Println("[Battery Optimization] Resetting all retry counters due to network/peer change")
+	qs.queues.Range(func(key, value interface{}) bool {
+		if q, ok := value.(*Queue); ok {
+			q.retryCount = 0
+			q.lastAttempt = time.Time{} // Reset last attempt to allow immediate retry
+			q.permanentFailure = false
+		}
+		return true
+	})
+
+	// Trigger immediate queue processing
+	select {
+	case qs.triggerCh <- struct{}{}:
+		qs.Log.Println("[Battery Optimization] Triggered immediate queue processing after reset")
+	default:
+		// Channel already has a trigger pending
+	}
+}
+
 type Queue struct {
 	queues           *Queues
 	destination      string
@@ -133,15 +156,6 @@ func (q *Queue) run() {
 	defer q.running.Store(false)
 	defer q.queues.Storage.MailExpunge("Outbox") // nolint:errcheck
 
-	// Check if we've exceeded maximum retries
-	if q.retryCount >= MAX_RETRY_ATTEMPTS {
-		q.permanentFailure = true
-		q.queues.Log.Printf("[Battery Optimization] Message to %s permanently failed after %d attempts - stopping retries\n",
-			q.destination, q.retryCount)
-		// TODO: Move to "Failed" mailbox or notify user
-		return
-	}
-
 	// Battery-optimized exponential backoff with jitter
 	if !q.lastAttempt.IsZero() && q.retryCount > 0 {
 		backoffSeconds := calculateBackoff(q.retryCount)
@@ -149,8 +163,8 @@ func (q *Queue) run() {
 		elapsed := time.Since(q.lastAttempt)
 		if elapsed < waitTime {
 			remaining := waitTime - elapsed
-			q.queues.Log.Printf("[Battery Optimization] Waiting %v before retry to %s (attempt %d/%d)\n",
-				remaining, q.destination, q.retryCount+1, MAX_RETRY_ATTEMPTS)
+			q.queues.Log.Printf("[Battery Optimization] Waiting %v before retry to %s (attempt %d)\n",
+				remaining, q.destination, q.retryCount+1)
 			time.Sleep(remaining)
 		}
 	}
@@ -171,6 +185,21 @@ func (q *Queue) run() {
 			} else {
 				q.queues.Log.Println("Failed to get mail", ref.ID, "due to error:", err)
 			}
+			continue
+		}
+
+		// Check if message has been undeliverable for too long
+		messageAge := time.Since(mail.Date)
+		if messageAge > time.Duration(UNDELIVERABLE_TIMEOUT_SECS)*time.Second {
+			q.queues.Log.Printf("[Battery Optimization] Message %d to %s is undeliverable (age: %v, max: %v) - marking as failed\n",
+				ref.ID, q.destination, messageAge, time.Duration(UNDELIVERABLE_TIMEOUT_SECS)*time.Second)
+
+			// Remove from queue
+			q.queues.Storage.QueueDeleteDestinationForID(q.destination, ref.ID)
+			if remaining, err := q.queues.Storage.QueueSelectIsMessagePendingSend("Outbox", ref.ID); err == nil && !remaining {
+				q.queues.Storage.MailDelete("Outbox", ref.ID)
+			}
+			// TODO: Move to "Failed" mailbox or notify user
 			continue
 		}
 
@@ -261,22 +290,9 @@ func (q *Queue) run() {
 			// Classify error type for intelligent retry
 			if isNetworkError(err) {
 				q.retryCount++
-				q.queues.Log.Printf("[Battery Optimization] Network error sending to %s (retry %d/%d): %v\n",
-					q.destination, q.retryCount, MAX_RETRY_ATTEMPTS, err)
-
-				// CRITICAL: Stop retrying if we've hit the maximum
-				if q.retryCount >= MAX_RETRY_ATTEMPTS {
-					q.permanentFailure = true
-					q.queues.Log.Printf("[Battery Optimization] Message to %s permanently failed after %d attempts - stopping retries\n",
-						q.destination, q.retryCount)
-					// Delete from queue to prevent manager from retrying
-					q.queues.Storage.QueueDeleteDestinationForID(q.destination, ref.ID)
-					if remaining, err := q.queues.Storage.QueueSelectIsMessagePendingSend("Outbox", ref.ID); err == nil && !remaining {
-						q.queues.Storage.MailDelete("Outbox", ref.ID)
-					}
-					// TODO: Move to "Failed" mailbox or notify user
-					return
-				}
+				q.queues.Log.Printf("[Battery Optimization] Network error sending to %s (retry %d): %v\n",
+					q.destination, q.retryCount, err)
+				// Will retry on next manager run with exponential backoff
 			} else if isPermanentError(err) {
 				q.permanentFailure = true
 				q.queues.Log.Printf("[Battery Optimization] Permanent error sending to %s - stopping retries: %v\n",
@@ -291,22 +307,9 @@ func (q *Queue) run() {
 			} else {
 				// Unknown error - treat as temporary
 				q.retryCount++
-				q.queues.Log.Printf("Failed to send to %s (retry %d/%d): %v\n",
-					q.destination, q.retryCount, MAX_RETRY_ATTEMPTS, err)
-
-				// CRITICAL: Stop retrying if we've hit the maximum
-				if q.retryCount >= MAX_RETRY_ATTEMPTS {
-					q.permanentFailure = true
-					q.queues.Log.Printf("[Battery Optimization] Message to %s permanently failed after %d attempts - stopping retries\n",
-						q.destination, q.retryCount)
-					// Delete from queue to prevent manager from retrying
-					q.queues.Storage.QueueDeleteDestinationForID(q.destination, ref.ID)
-					if remaining, err := q.queues.Storage.QueueSelectIsMessagePendingSend("Outbox", ref.ID); err == nil && !remaining {
-						q.queues.Storage.MailDelete("Outbox", ref.ID)
-					}
-					// TODO: Move to "Failed" mailbox or notify user
-					return
-				}
+				q.queues.Log.Printf("Failed to send to %s (retry %d): %v\n",
+					q.destination, q.retryCount, err)
+				// Will retry on next manager run with exponential backoff
 			}
 		} else {
 			q.retryCount = 0 // Reset retry count on success
@@ -318,7 +321,7 @@ func (q *Queue) run() {
 
 // calculateBackoff calculates exponential backoff with jitter
 func calculateBackoff(retryCount int) int {
-	// Exponential backoff: 5, 10, 20, 40, 80, 160, 300, 300...
+	// Exponential backoff: 30, 60, 120, 240, 480, 960, 1920, 1920...
 	backoff := float64(MIN_BACKOFF_SECONDS) * math.Pow(BACKOFF_MULTIPLIER, float64(retryCount-1))
 
 	// Cap at maximum
