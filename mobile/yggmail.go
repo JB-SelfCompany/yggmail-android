@@ -90,6 +90,7 @@ type YggmailService struct {
 	heartbeatDone     chan struct{}
 	heartbeatInterval time.Duration
 	isActive          bool // Track if user is actively using the app
+	isCharging        bool // Track if device is charging (for adaptive power management)
 	lastMailActivity  time.Time
 }
 
@@ -237,13 +238,18 @@ func (s *YggmailService) Start(peers string) error {
 		return fmt.Errorf("must specify at least one static peer")
 	}
 
-	// Initialize Yggdrasil transport
+	// Initialize Yggdrasil transport with adaptive battery optimization
 	rawLogger := log.New(s.logger.Writer(), "", 0)
+	// Note: s.mu is already locked by Start(), no need for RLock
+	isActive := s.isActive
+	isCharging := s.isCharging
 	transport, err := transport.NewYggdrasilTransport(
 		rawLogger,
 		s.config.PrivateKey,
 		s.config.PublicKey,
 		peerList,
+		isActive,
+		isCharging,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create transport: %w", err)
@@ -341,6 +347,10 @@ type mailCallbackAdapter struct {
 func (a *mailCallbackAdapter) OnNewMail(from string, mailID int) {
 	// Record mail activity for aggressive heartbeat mode
 	a.service.RecordMailActivity()
+
+	// IMMEDIATE DELIVERY: Send heartbeat notification right away
+	// Don't wait for next scheduled heartbeat - notify IMAP IDLE clients immediately
+	go a.service.sendHeartbeat()
 
 	if a.service.mailCallback != nil {
 		// Extract mailbox name and get mail details
@@ -957,7 +967,7 @@ func (s *YggmailService) OnNetworkChange() error {
 		}
 	}
 
-	// Restart transport with same parameters
+	// Restart transport with same parameters and current power state
 	s.mu.Lock()
 	rawLogger := log.New(s.logger.Writer(), "", 0)
 	newTransport, err := transport.NewYggdrasilTransport(
@@ -965,6 +975,8 @@ func (s *YggmailService) OnNetworkChange() error {
 		s.config.PrivateKey,
 		s.config.PublicKey,
 		strings.Split(peers, ","),
+		s.isActive,
+		s.isCharging,
 	)
 	if err != nil {
 		s.mu.Unlock()
@@ -1042,6 +1054,22 @@ func (s *YggmailService) SetActive(active bool) {
 			s.logger.Println("App became active, increasing heartbeat frequency")
 		} else {
 			s.logger.Println("App became inactive, will reduce heartbeat frequency")
+		}
+	}
+}
+
+// SetCharging sets whether the device is charging
+// Charging state allows more aggressive network activity for better sync
+func (s *YggmailService) SetCharging(charging bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.isCharging != charging {
+		s.isCharging = charging
+		if charging {
+			s.logger.Println("Device charging, can use more aggressive network activity")
+		} else {
+			s.logger.Println("Device on battery, switching to power-efficient mode")
 		}
 	}
 }
@@ -1152,6 +1180,7 @@ func (s *YggmailService) heartbeatSender() {
 }
 
 // calculateAdaptiveInterval determines optimal heartbeat interval based on activity
+// Battery-optimized: intervals range from 10s (active sending) to 29min (deep idle)
 func (s *YggmailService) calculateAdaptiveInterval() time.Duration {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -1159,24 +1188,45 @@ func (s *YggmailService) calculateAdaptiveInterval() time.Duration {
 	timeSinceMailActivity := time.Since(s.lastMailActivity)
 	timeSinceActivity := time.Since(s.lastActivity)
 
-	// Aggressive mode: Recent mail activity (< 2 minutes)
-	if timeSinceMailActivity < 2*time.Minute {
-		return 5 * time.Second
+	// If charging, can be more aggressive across all modes
+	chargingMultiplier := 1.0
+	if s.isCharging {
+		chargingMultiplier = 0.5 // Half the intervals when charging
 	}
 
-	// Active mode: Recent app activity (< 5 minutes)
-	if timeSinceActivity < 5*time.Minute || s.isActive {
-		return 15 * time.Second
+	// Aggressive mode: ACTIVELY sending/receiving mail (< 30 seconds)
+	// Very frequent heartbeat for immediate delivery confirmation
+	if timeSinceMailActivity < 30*time.Second {
+		interval := 5 * time.Second
+		return time.Duration(float64(interval) * chargingMultiplier)
 	}
 
-	// Idle mode: Some activity (< 15 minutes)
-	if timeSinceActivity < 15*time.Minute {
-		return 30 * time.Second
+	// Active mode: App is in foreground
+	// Moderate heartbeat for responsive UI updates
+	if s.isActive {
+		interval := 30 * time.Second
+		return time.Duration(float64(interval) * chargingMultiplier)
 	}
 
-	// Deep idle mode: No activity for long time
-	// Still need heartbeat but can be very infrequent
-	return 60 * time.Second
+	// Moderate idle: Recent background activity (< 10 minutes)
+	// Balance between delivery speed and battery
+	if timeSinceActivity < 10*time.Minute {
+		interval := 2 * time.Minute
+		return time.Duration(float64(interval) * chargingMultiplier)
+	}
+
+	// Deep idle: No activity for a while (< 30 minutes)
+	// Longer intervals but still reasonable for message delivery
+	if timeSinceActivity < 30*time.Minute {
+		interval := 5 * time.Minute
+		return time.Duration(float64(interval) * chargingMultiplier)
+	}
+
+	// Ultra deep idle: Long inactivity - Doze Mode compatible
+	// RFC 2177 IMAP IDLE maximum is 29 minutes
+	// Note: Real message delivery uses push notification, not heartbeat polling
+	interval := 29 * time.Minute
+	return time.Duration(float64(interval) * chargingMultiplier)
 }
 
 // sendHeartbeat sends a lightweight notification to IMAP IDLE clients

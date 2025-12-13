@@ -31,11 +31,15 @@ import (
 
 const (
 	// Battery-optimized retry strategy with long delays for mobile networks
-	// Retries at: 30, 90, 210, 450, 930, 1890, 3810, 5730, 7650, 9570 seconds from start
-	MIN_BACKOFF_SECONDS        = 30   // Start at 30 seconds
-	MAX_BACKOFF_SECONDS        = 1920 // Cap at 32 minutes
-	BACKOFF_MULTIPLIER         = 2.0  // Exponential growth factor
+	// Retries at: 60, 180, 420, 900, 1860, 3720 seconds from start (then capped at 3600)
+	MIN_BACKOFF_SECONDS        = 60    // Start at 60 seconds (reduced from 30 for battery)
+	MAX_BACKOFF_SECONDS        = 3600  // Cap at 60 minutes (increased from 32 for battery)
+	BACKOFF_MULTIPLIER         = 2.0   // Exponential growth factor
 	UNDELIVERABLE_TIMEOUT_SECS = 604800 // 7 days - report as undeliverable after this time
+
+	// Adaptive queue manager intervals for battery optimization
+	MANAGER_INTERVAL_ACTIVE = 60  // 1 minute when there are queued messages
+	MANAGER_INTERVAL_IDLE   = 300 // 5 minutes when queue is empty
 )
 
 type Queues struct {
@@ -67,8 +71,16 @@ func (qs *Queues) manager() {
 	for _, destination := range destinations {
 		_, _ = qs.queueFor(destination)
 	}
-	// Reduced retry interval for faster delivery attempts (mobile-friendly)
-	time.AfterFunc(time.Second*30, qs.manager)
+
+	// Adaptive interval based on queue status for battery optimization
+	// Active interval (60s) when messages are queued, idle interval (5min) when empty
+	// This reduces unnecessary wakeups from 2,880/day to 288/day when idle
+	interval := MANAGER_INTERVAL_IDLE
+	if len(destinations) > 0 {
+		interval = MANAGER_INTERVAL_ACTIVE
+	}
+
+	time.AfterFunc(time.Second*time.Duration(interval), qs.manager)
 }
 
 func (qs *Queues) QueueFor(from string, rcpts []string, content []byte) error {
