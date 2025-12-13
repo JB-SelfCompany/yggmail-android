@@ -61,7 +61,11 @@ func (b *Backend) Login(state *smtp.ConnectionState, username, password string) 
 			b.Log.Printf("Failed to authenticate SMTP user %q\n", username)
 			return nil, smtp.ErrAuthRequired
 		}
-		defer b.Log.Printf("Authenticated SMTP user from %s as %q\n", state.RemoteAddr.String(), username)
+		remoteAddr := "unknown"
+		if state != nil && state.RemoteAddr != nil {
+			remoteAddr = state.RemoteAddr.String()
+		}
+		defer b.Log.Printf("Authenticated SMTP user from %s as %q\n", remoteAddr, username)
 		return &SessionLocal{
 			backend: b,
 			state:   state,
@@ -82,6 +86,9 @@ func (b *Backend) AnonymousLogin(state *smtp.ConnectionState) (smtp.Session, err
 	case BackendModeExternal:
 		// The connection came from our overlay listener, so we should check
 		// that they are who they claim to be
+		if state == nil || state.RemoteAddr == nil {
+			return nil, fmt.Errorf("invalid connection state")
+		}
 		pks, err := hex.DecodeString(state.RemoteAddr.String())
 		if err != nil {
 			return nil, fmt.Errorf("hex.DecodeString: %w", err)

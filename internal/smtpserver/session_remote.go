@@ -34,6 +34,9 @@ func (s *SessionRemote) Mail(from string, opts smtp.MailOptions) error {
 		return fmt.Errorf("mail.ParseAddress: %w", err)
 	}
 
+	if s.state == nil || s.state.RemoteAddr == nil {
+		return fmt.Errorf("invalid connection state")
+	}
 	if remote := s.state.RemoteAddr.String(); hex.EncodeToString(pk) != remote {
 		return fmt.Errorf("not allowed to send incoming mail as %s", from)
 	}

@@ -54,9 +54,13 @@ func (s *SessionLocal) Data(r io.Reader) error {
 		return fmt.Errorf("message.Read: %w", err)
 	}
 
+	remoteAddr := "unknown"
+	if s.state != nil && s.state.RemoteAddr != nil {
+		remoteAddr = s.state.RemoteAddr.String()
+	}
 	m.Header.Add(
 		"Received", fmt.Sprintf("from %s by Yggmail %s; %s",
-			s.state.RemoteAddr.String(),
+			remoteAddr,
 			hex.EncodeToString(s.backend.Config.PublicKey),
 			time.Now().String(),
 		),
