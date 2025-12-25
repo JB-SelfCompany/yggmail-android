@@ -24,27 +24,68 @@ Yggdrasil is well-suited for ad-hoc mail delivery and allows Yggmail to work eve
 
 ## Quickstart
 
+### Prerequisites
+
+- Go 1.25.5 or later
+- CGO enabled (required for SQLite support via `mattn/go-sqlite3`)
+- C compiler (gcc on Linux/macOS, MinGW-w64 or TDM-GCC on Windows)
+
+### Installation
+
 Use a recent version of Go to install Yggmail:
 
-```
-go install github.com/neilalexander/yggmail/cmd/yggmail@latest
+```bash
+go install github.com/JB-SelfCompany/yggmail/cmd/yggmail@latest
 ```
 
 It will then be installed into your `GOPATH`, so add that to your environment:
 
-```
+```bash
 export PATH=$PATH:`go env GOPATH`/bin
 ```
 
+**Note:** If you get build errors related to CGO or SQLite, make sure you have a C compiler installed and CGO is enabled (`CGO_ENABLED=1`).
+
+Alternatively, build from source:
+
+```bash
+# Clone the repository
+git clone https://github.com/JB-SelfCompany/yggmail.git
+cd yggmail
+
+# Build the binary
+go build -o yggmail ./cmd/yggmail
+
+# Or run directly
+go run ./cmd/yggmail
+```
+
+### Docker Alternative
+
+You can also run Yggmail in Docker:
+
+```bash
+# Build the image
+docker build -t yggmail .
+
+# Run with multicast
+docker run -p 1025:1025 -p 1143:1143 -v /path/to/data:/etc/yggmail yggmail -multicast
+
+# Run with static peer
+docker run -p 1025:1025 -p 1143:1143 -v /path/to/data:/etc/yggmail yggmail -peer=tls://[peer-address]:port
+```
+
+### First Run
+
 Create a mailbox and set your password. Your Yggmail database will automatically be created in your working directory if it doesn't already exist:
 
-```
+```bash
 yggmail -password
 ```
 
 Start Yggmail, using the database in your working directory, with either multicast enabled, an [Yggdrasil static peer](https://publicpeers.neilalexander.dev/) specified or both:
 
-```
+```bash
 yggmail -multicast
 yggmail -peer=tls://...
 yggmail -multicast -peer=tls://...
@@ -80,7 +121,7 @@ There are a few important notes:
 * Yggmail tries to guarantee that senders are who they say they are. Your `From` address must be your Yggmail address;
 * You can only email other Yggmail users, not regular email addresses on the public Internet;
 * You may need to configure your client to allow "insecure" or "plaintext" authentication to IMAP/SMTP — this is because we don't support SSL/TLS on the IMAP/SMTP listeners yet;
-* Yggmail won't transport mails larger than 1MB right now.
+* Maximum message size is 500 MB (messages larger than 1MB are stored on filesystem via FileStore).
 
 ## Android Library Build
 
@@ -93,7 +134,7 @@ This fork includes the `mobile/` directory with Go bindings for building an Andr
 
 ### Prerequisites
 
-1. Install Go (1.24.0 or later)
+1. Install Go (1.25.5 or later, requires CGO support for SQLite)
 2. Install gomobile:
    ```bash
    go install golang.org/x/mobile/cmd/gomobile@latest
@@ -107,24 +148,24 @@ This fork includes the `mobile/` directory with Go bindings for building an Andr
 
 ### Building the Android Library
 
-#### Windows (Recommended)
+#### Windows
 
-1. **First-time setup:**
-   ```cmd
-   setup-gomobile.bat
-   ```
-   This will install gomobile and configure Android SDK paths.
+**Note:** Before building, make sure to:
+1. Install gomobile: `go install golang.org/x/mobile/cmd/gomobile@latest && gomobile init`
+2. Update `ANDROID_HOME` path in `build-android.bat` to point to your Android SDK
 
-2. **Build the library:**
-   ```cmd
-   REM Full build (all architectures - ~40MB)
-   build-android.bat
+**Build the library:**
+```cmd
+cd mobile
 
-   REM Or ARM64 only (smaller size - ~15MB)
-   build-android-small.bat
-   ```
+REM Full build (all architectures - ~40MB)
+build-android.bat
 
-   **Note:** Build scripts automatically include `-ldflags="-checklinkname=0"` to workaround a known issue with `github.com/wlynxg/anet` dependency.
+REM Or ARM64 only (smaller size - ~15MB)
+build-android-small.bat
+```
+
+**Note:** Build scripts automatically include `-ldflags="-checklinkname=0"` to workaround a known issue with `github.com/wlynxg/anet` dependency.
 
 #### Linux/macOS
 
@@ -134,7 +175,7 @@ go install golang.org/x/mobile/cmd/gomobile@latest
 gomobile init
 
 # Build AAR file for Android (with workaround for wlynxg/anet issue)
-gomobile bind -target=android -androidapi 23 -ldflags="-checklinkname=0" -o yggmail.aar github.com/neilalexander/yggmail/mobile
+gomobile bind -target=android -androidapi 23 -ldflags="-checklinkname=0" -o yggmail.aar github.com/JB-SelfCompany/yggmail/mobile
 ```
 
 This will generate:
@@ -147,13 +188,13 @@ You can customize the build with additional flags:
 
 ```bash
 # Build for specific architectures (reduces size)
-gomobile bind -target=android/arm64,android/amd64 -androidapi 23 -ldflags="-checklinkname=0" -o yggmail.aar github.com/neilalexander/yggmail/mobile
+gomobile bind -target=android/arm64,android/amd64 -androidapi 23 -ldflags="-checklinkname=0" -o yggmail.aar github.com/JB-SelfCompany/yggmail/mobile
 
 # ARM64 only (smallest, for modern devices)
-gomobile bind -target=android/arm64 -androidapi 23 -ldflags="-checklinkname=0" -o yggmail.aar github.com/neilalexander/yggmail/mobile
+gomobile bind -target=android/arm64 -androidapi 23 -ldflags="-checklinkname=0" -o yggmail.aar github.com/JB-SelfCompany/yggmail/mobile
 
 # Different Android API levels
-gomobile bind -target=android -androidapi 21 -ldflags="-checklinkname=0" -o yggmail.aar github.com/neilalexander/yggmail/mobile
+gomobile bind -target=android -androidapi 21 -ldflags="-checklinkname=0" -o yggmail.aar github.com/JB-SelfCompany/yggmail/mobile
 ```
 
 **Important:** Always include `-ldflags="-checklinkname=0"` due to a known compatibility issue with Go 1.24+ and the `wlynxg/anet` dependency.
@@ -169,25 +210,73 @@ gomobile bind -target=android -androidapi 21 -ldflags="-checklinkname=0" -o yggm
    ```
 
 3. Use the library in your code:
-   ```java
-   import mobile.YggmailService;
+   ```kotlin
+   import mobile.Mobile
+   import mobile.YggmailService
+   import mobile.LogCallback
+   import mobile.MailCallback
+   import mobile.ConnectionCallback
+
+   // Create callbacks
+   val logCallback = object : LogCallback {
+       override fun onLog(level: String, tag: String, message: String) {
+           Log.d(tag, "[$level] $message")
+       }
+   }
+
+   val mailCallback = object : MailCallback {
+       override fun onNewMail(mailbox: String, from: String, subject: String, mailID: Long) {
+           // Handle new mail notification
+       }
+       override fun onMailSent(to: String, subject: String) {
+           // Handle mail sent confirmation
+       }
+       override fun onMailError(to: String, subject: String, errorMsg: String) {
+           // Handle mail send error
+       }
+   }
 
    // Initialize service
-   YggmailService service = Mobile.newYggmailService(
+   val service = Mobile.newYggmailService(
        "/path/to/database.db",
        "localhost:1025",  // SMTP
        "localhost:1143"   // IMAP
-   );
+   )
+
+   // Set callbacks
+   service.setLogCallback(logCallback)
+   service.setMailCallback(mailCallback)
 
    // Initialize and start
-   service.initialize();
-   service.start("tls://peer1.example.com:12345", true, ".*");
+   service.initialize()
+   service.start("tls://peer1.example.com:12345", true, ".*")
 
    // Get email address
-   String address = service.getMailAddress();
+   val address = service.mailAddress
+
+   // Check unread quota
+   val quotaInfo = service.unreadQuotaInfo
+   Log.d("Yggmail", "Quota: ${quotaInfo.usedMB}/${quotaInfo.quotaMB} MB")
+
+   // Cleanup when done
+   service.stop()
+   service.close()
    ```
 
 For detailed API documentation, see the source code in `mobile/yggmail.go`.
+
+**Key Mobile API Methods:**
+- `Initialize()` - Initialize the service (call once)
+- `Start(peers, multicast, mcastRegexp)` - Start SMTP/IMAP servers and Yggdrasil
+- `Stop()` - Stop servers
+- `Close()` - Clean shutdown (call before app exit)
+- `GetMailAddress()` - Get your Yggmail address
+- `SetUnreadQuotaMB(mb)` - Set quota limit
+- `CheckRecipientQuota(email, size)` - Pre-check recipient quota
+- `OnNetworkChange()` - Call when WiFi/Mobile network changes
+- `UpdatePeers(peers)` - Update peer list without restart
+- `SetActive(active)` - Optimize for foreground/background
+- `FindAvailablePeersAsync(callback)` - Discover available public peers
 
 ### Mobile Network Stability
 
@@ -205,3 +294,43 @@ There are probably all sorts of bugs, but the ones that we know of are:
 * IMAP search isn't implemented yet and will instead return all mails.
 
 The code's also a bit of a mess, so sorry about that.
+
+## Additional Features in This Fork
+
+### Large File Support (FileStore)
+- Messages larger than 1MB are automatically stored in the filesystem instead of SQLite
+- Supports up to 500 MB per message
+- Atomic writes prevent corruption during transfers
+- Directory structure: `basePath/mailbox/messageID.eml`
+
+### Unread Quota System
+- Configurable limit on total size of unread messages (default: 10 MB)
+- Prevents inbox overflow and controls disk usage
+- Pre-send quota checking for 1-on-1 chats to avoid wasting bandwidth
+- Mobile API methods: `SetUnreadQuotaMB()`, `GetUnreadQuotaInfo()`, `CheckRecipientQuota()`
+
+### Peer Discovery Integration
+- Asynchronous peer availability checking via `yggpeers` library
+- Supports filtering by protocol (tcp, tls, quic, ws, wss) and region
+- Configurable batching for different network conditions
+- 24-hour cache TTL, 5-second check timeout
+
+### Battery Optimization
+- Adaptive QUIC keep-alive: 5s (active) to 30s (background)
+- Adaptive heartbeat intervals: 5s to 29 minutes based on activity
+- Idle timeout checker with configurable thresholds
+- Power state awareness: `SetActive()`, `SetCharging()` methods
+- Reduced queue manager wakeups: 60s (active) to 300s (idle)
+
+### Testing Infrastructure
+E2E test suite in `internal/e2e/`:
+```bash
+# Run E2E tests for large file transfers
+go test ./internal/e2e -run TestLargeFileTransfer
+
+# Run resilience tests (network disruption recovery)
+go test ./internal/e2e -run TestResilience
+
+# Run performance benchmarks
+go test -bench=. ./internal/e2e
+```

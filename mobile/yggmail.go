@@ -29,13 +29,15 @@ import (
 	"github.com/emersion/go-sasl"
 	"github.com/emersion/go-smtp"
 	"github.com/JB-SelfCompany/yggpeers"
-	"github.com/neilalexander/yggmail/internal/config"
-	"github.com/neilalexander/yggmail/internal/imapserver"
-	"github.com/neilalexander/yggmail/internal/smtpsender"
-	"github.com/neilalexander/yggmail/internal/smtpserver"
-	"github.com/neilalexander/yggmail/internal/storage/sqlite3"
-	"github.com/neilalexander/yggmail/internal/transport"
-	"github.com/neilalexander/yggmail/internal/utils"
+	"github.com/JB-SelfCompany/yggmail/internal/config"
+	"github.com/JB-SelfCompany/yggmail/internal/imapserver"
+	"github.com/JB-SelfCompany/yggmail/internal/logging"
+	"github.com/JB-SelfCompany/yggmail/internal/smtpsender"
+	"github.com/JB-SelfCompany/yggmail/internal/smtpserver"
+	"github.com/JB-SelfCompany/yggmail/internal/storage/filestore"
+	"github.com/JB-SelfCompany/yggmail/internal/storage/sqlite3"
+	"github.com/JB-SelfCompany/yggmail/internal/transport"
+	"github.com/JB-SelfCompany/yggmail/internal/utils"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -86,6 +88,8 @@ type YggmailService struct {
 	logCallback       LogCallback
 	mailCallback      MailCallback
 	connCallback      ConnectionCallback
+	fileStore         *filestore.FileStore
+	largeMailLogger   *logging.LargeMailLogger
 	running           bool
 	stopChan          chan struct{}
 	smtpDone          chan struct{}
@@ -235,6 +239,31 @@ func (s *YggmailService) Initialize() error {
 		}
 	}
 
+	// Database migrations are now run automatically in NewSQLite3StorageStorage()
+
+	// Initialize FileStore for large message files
+	mailDataPath := s.databasePath + ".maildata"
+	fileStore, err := filestore.NewFileStore(mailDataPath)
+	if err != nil {
+		return fmt.Errorf("failed to initialize file store: %w", err)
+	}
+	s.fileStore = fileStore
+	s.logger.Printf("Initialized file store at %q\n", mailDataPath)
+
+	// Initialize LargeMailLogger
+	s.largeMailLogger = logging.NewLargeMailLogger()
+	s.logger.Println("Initialized large mail logger")
+
+	// Start background migration of large messages to files (non-blocking)
+	go func() {
+		s.logger.Println("Starting background migration of large messages to files...")
+		if err := s.storage.MigrateLargeMessagesToFiles(s.fileStore, 10*1024*1024); err != nil {
+			s.logger.Printf("Warning: background migration failed: %v\n", err)
+		} else {
+			s.logger.Println("Background migration completed successfully")
+		}
+	}()
+
 	return nil
 }
 
@@ -285,12 +314,16 @@ func (s *YggmailService) Start(peers string) error {
 
 	// Initialize SMTP queues
 	s.queues = smtpsender.NewQueues(s.config, s.logger, s.transport, s.storage)
+	s.queues.FileStore = s.fileStore
+	s.queues.LargeMailLogger = s.largeMailLogger
 
 	// Initialize IMAP server
 	s.imapBackend = &imapserver.Backend{
-		Log:     s.logger,
-		Config:  s.config,
-		Storage: s.storage,
+		Log:             s.logger,
+		Config:          s.config,
+		Storage:         s.storage,
+		FileStore:       s.fileStore,
+		LargeMailLogger: s.largeMailLogger,
 	}
 
 	imapServer, notify, err := imapserver.NewIMAPServer(s.imapBackend, s.imapAddr, true)
@@ -338,18 +371,20 @@ func (s *YggmailService) startLocalSMTP() {
 	defer close(s.smtpDone)
 
 	localBackend := &smtpserver.Backend{
-		Log:     s.logger,
-		Mode:    smtpserver.BackendModeInternal,
-		Config:  s.config,
-		Storage: s.storage,
-		Queues:  s.queues,
-		Notify:  s.imapNotify,
+		Log:             s.logger,
+		Mode:            smtpserver.BackendModeInternal,
+		Config:          s.config,
+		Storage:         s.storage,
+		Queues:          s.queues,
+		Notify:          s.imapNotify,
+		FileStore:       s.fileStore,
+		LargeMailLogger: s.largeMailLogger,
 	}
 
 	s.localSMTP = smtp.NewServer(localBackend)
 	s.localSMTP.Addr = s.smtpAddr
 	s.localSMTP.Domain = hex.EncodeToString(s.config.PublicKey)
-	s.localSMTP.MaxMessageBytes = 1024 * 1024 * 32
+	s.localSMTP.MaxMessageBytes = 500 * 1024 * 1024 // 500 MB for large file support
 	s.localSMTP.MaxRecipients = 50
 	s.localSMTP.AllowInsecureAuth = true
 	s.localSMTP.EnableAuth(sasl.Login, func(conn *smtp.Conn) sasl.Server {
@@ -359,7 +394,11 @@ func (s *YggmailService) startLocalSMTP() {
 		})
 	})
 
-	s.logger.Println("Listening for SMTP on:", s.localSMTP.Addr)
+	s.logger.Printf("Local SMTP server starting on %s - MaxMessageBytes=%d (%.2f MB), Domain=%s",
+		s.localSMTP.Addr,
+		s.localSMTP.MaxMessageBytes,
+		float64(s.localSMTP.MaxMessageBytes)/(1024*1024),
+		s.localSMTP.Domain)
 	if err := s.localSMTP.ListenAndServe(); err != nil {
 		s.logger.Printf("Local SMTP server stopped: %v\n", err)
 	}
@@ -390,20 +429,32 @@ func (s *YggmailService) startOverlaySMTP() {
 	defer close(s.overlayDone)
 
 	overlayBackend := &smtpserver.Backend{
-		Log:          s.logger,
-		Mode:         smtpserver.BackendModeExternal,
-		Config:       s.config,
-		Storage:      s.storage,
-		Queues:       s.queues,
-		Notify:       s.imapNotify,
-		MailCallback: &mailCallbackAdapter{service: s},
+		Log:             s.logger,
+		Mode:            smtpserver.BackendModeExternal,
+		Config:          s.config,
+		Storage:         s.storage,
+		Queues:          s.queues,
+		Notify:          s.imapNotify,
+		MailCallback:    &mailCallbackAdapter{service: s},
+		FileStore:       s.fileStore,
+		LargeMailLogger: s.largeMailLogger,
 	}
 
 	s.overlaySMTP = smtp.NewServer(overlayBackend)
 	s.overlaySMTP.Domain = hex.EncodeToString(s.config.PublicKey)
-	s.overlaySMTP.MaxMessageBytes = 1024 * 1024 * 32
+	s.overlaySMTP.MaxMessageBytes = 500 * 1024 * 1024 // 500 MB for large file support
 	s.overlaySMTP.MaxRecipients = 50
 	s.overlaySMTP.AuthDisabled = true
+	// Enable debug writer to log SMTP protocol exchange
+	if false { // Set to true to enable detailed SMTP protocol logging
+		s.overlaySMTP.Debug = s.logger.Writer()
+	}
+
+	s.logger.Printf("Overlay SMTP server starting - MaxMessageBytes=%d (%.2f MB), Domain=%s",
+		s.overlaySMTP.MaxMessageBytes,
+		float64(s.overlaySMTP.MaxMessageBytes)/(1024*1024),
+		s.overlaySMTP.Domain)
+	s.logger.Printf("Overlay SMTP SIZE extension will advertise: SIZE %d", s.overlaySMTP.MaxMessageBytes)
 
 	if err := s.overlaySMTP.Serve(s.transport.Listener()); err != nil {
 		s.logger.Printf("Overlay SMTP server stopped: %v\n", err)
@@ -781,6 +832,12 @@ type PeerConnectionInfo struct {
 	TXBytes       int64   // Total bytes transmitted
 	RXRate        int64   // Current receive rate (bytes/sec)
 	TXRate        int64   // Current transmit rate (bytes/sec)
+}
+
+// MailStorageStats represents storage statistics for mail data
+type MailStorageStats struct {
+	DbSize   int64 // Database file size in bytes
+	FileSize int64 // File storage size in bytes
 }
 
 // GetMailList returns list of mails in a mailbox
@@ -1796,6 +1853,311 @@ func parsePeerURI(uri string) (*yggpeers.Peer, error) {
 		Protocol: protocol,
 		Host:     host,
 		Port:     port,
+	}, nil
+}
+
+// GetMailStorageStats returns storage statistics
+// Returns database size and file storage size in bytes
+func (s *YggmailService) GetMailStorageStats() (*MailStorageStats, error) {
+	s.mu.RLock()
+	storage := s.storage
+	fileStore := s.fileStore
+	dbPath := s.databasePath
+	s.mu.RUnlock()
+
+	if storage == nil {
+		return nil, fmt.Errorf("service not initialized")
+	}
+
+	stats := &MailStorageStats{}
+
+	// Get database file size
+	dbInfo, err := os.Stat(dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get database size: %w", err)
+	}
+	stats.DbSize = dbInfo.Size()
+
+	// Get total file store size
+	if fileStore != nil {
+		fileSize, err := fileStore.GetTotalSize()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get file store size: %w", err)
+		}
+		stats.FileSize = fileSize
+	}
+
+	return stats, nil
+}
+
+// GetMailSize returns the size of a mail message in bytes
+// Works for both small messages (stored in database) and large messages (stored in files)
+func (s *YggmailService) GetMailSize(mailbox string, mailID int) (int64, error) {
+	s.mu.RLock()
+	storage := s.storage
+	s.mu.RUnlock()
+
+	if storage == nil {
+		return 0, fmt.Errorf("service not initialized")
+	}
+
+	// Select mail from database
+	_, mailData, err := storage.MailSelect(mailbox, mailID)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get mail: %w", err)
+	}
+
+	// Return the stored size
+	// Size field contains the actual message size regardless of storage method
+	return mailData.Size, nil
+}
+
+// SetUnreadQuotaMB sets the quota for unread messages in megabytes
+// This limits the total size of unread messages across all mailboxes
+func (s *YggmailService) SetUnreadQuotaMB(megabytes int64) error {
+	s.mu.RLock()
+	storage := s.storage
+	s.mu.RUnlock()
+
+	if storage == nil {
+		return fmt.Errorf("service not initialized")
+	}
+
+	if megabytes < 0 {
+		return fmt.Errorf("quota cannot be negative")
+	}
+
+	bytes := megabytes * 1024 * 1024
+	if err := storage.ConfigSetUnreadQuota(bytes); err != nil {
+		return fmt.Errorf("failed to set unread quota: %w", err)
+	}
+
+	s.logger.Printf("Unread quota set to %d MB (%d bytes)\n", megabytes, bytes)
+	return nil
+}
+
+// GetUnreadQuotaMB returns the current unread quota in megabytes
+func (s *YggmailService) GetUnreadQuotaMB() (int64, error) {
+	s.mu.RLock()
+	storage := s.storage
+	s.mu.RUnlock()
+
+	if storage == nil {
+		return 0, fmt.Errorf("service not initialized")
+	}
+
+	bytes, err := storage.ConfigGetUnreadQuota()
+	if err != nil {
+		return 0, fmt.Errorf("failed to get unread quota: %w", err)
+	}
+
+	return bytes / (1024 * 1024), nil
+}
+
+// GetUnreadSizeMB returns the current total size of unread messages in megabytes
+func (s *YggmailService) GetUnreadSizeMB() (float64, error) {
+	s.mu.RLock()
+	storage := s.storage
+	s.mu.RUnlock()
+
+	if storage == nil {
+		return 0, fmt.Errorf("service not initialized")
+	}
+
+	bytes, err := storage.MailGetUnreadSize()
+	if err != nil {
+		return 0, fmt.Errorf("failed to get unread size: %w", err)
+	}
+
+	return float64(bytes) / (1024 * 1024), nil
+}
+
+// UnreadQuotaInfo contains information about unread quota usage
+type UnreadQuotaInfo struct {
+	QuotaMB      int64   // Total quota in MB
+	UsedMB       float64 // Currently used space in MB
+	FreeMB       float64 // Free space in MB
+	UsedPercent  float64 // Percentage used (0-100)
+	UnreadCount  int     // Number of unread messages
+	IsExceeded   bool    // True if quota is exceeded
+}
+
+// GetUnreadQuotaInfo returns detailed information about unread quota usage
+func (s *YggmailService) GetUnreadQuotaInfo() (*UnreadQuotaInfo, error) {
+	s.mu.RLock()
+	storage := s.storage
+	s.mu.RUnlock()
+
+	if storage == nil {
+		return nil, fmt.Errorf("service not initialized")
+	}
+
+	// Get quota
+	quotaBytes, err := storage.ConfigGetUnreadQuota()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get quota: %w", err)
+	}
+
+	// Get current unread size
+	usedBytes, err := storage.MailGetUnreadSize()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get unread size: %w", err)
+	}
+
+	// Get unread count for INBOX (main mailbox)
+	unreadCount, err := storage.MailUnseen("INBOX")
+	if err != nil {
+		s.logger.Printf("Warning: failed to get unread count: %v\n", err)
+		unreadCount = 0
+	}
+
+	quotaMB := quotaBytes / (1024 * 1024)
+	usedMB := float64(usedBytes) / (1024 * 1024)
+	freeMB := float64(quotaBytes-usedBytes) / (1024 * 1024)
+
+	var usedPercent float64
+	if quotaBytes > 0 {
+		usedPercent = (float64(usedBytes) / float64(quotaBytes)) * 100
+	}
+
+	info := &UnreadQuotaInfo{
+		QuotaMB:     quotaMB,
+		UsedMB:      usedMB,
+		FreeMB:      freeMB,
+		UsedPercent: usedPercent,
+		UnreadCount: unreadCount,
+		IsExceeded:  usedBytes > quotaBytes,
+	}
+
+	return info, nil
+}
+
+// QuotaCheckResult represents the result of recipient quota check
+type QuotaCheckResult struct {
+	CanSend       bool    // Whether message can be sent (quota sufficient)
+	ErrorMessage  string  // Error message if CanSend is false
+	RecipientAddr string  // Recipient address checked
+	MessageSizeMB float64 // Message size in MB
+}
+
+// CheckRecipientQuota checks if recipient has enough quota to receive the message.
+// This should be called BEFORE sending in 1-on-1 chats to avoid wasting bandwidth.
+// For group chats, skip this check - send to all, those with quota will accept.
+//
+// Parameters:
+//   - recipientEmail: Full email address (e.g., "abc123...@yggmail")
+//   - messageSizeBytes: Size of message to send in bytes
+//
+// Returns QuotaCheckResult with CanSend=true if quota is sufficient, false otherwise.
+func (s *YggmailService) CheckRecipientQuota(recipientEmail string, messageSizeBytes int64) (*QuotaCheckResult, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if !s.running {
+		return nil, fmt.Errorf("service not running")
+	}
+
+	// Parse recipient address to extract public key
+	recipientPubKey, err := utils.ParseAddress(recipientEmail)
+	if err != nil {
+		return nil, fmt.Errorf("invalid recipient address: %w", err)
+	}
+
+	recipientHex := hex.EncodeToString(recipientPubKey)
+	messageSizeMB := float64(messageSizeBytes) / (1024 * 1024)
+
+	s.logger.Printf("Checking quota for recipient %s, message size %.2f MB", recipientHex[:8], messageSizeMB)
+
+	// Connect to recipient's server
+	conn, err := s.transport.Dial(recipientHex)
+	if err != nil {
+		return &QuotaCheckResult{
+			CanSend:       false,
+			ErrorMessage:  fmt.Sprintf("Cannot connect to recipient: %v", err),
+			RecipientAddr: recipientEmail,
+			MessageSizeMB: messageSizeMB,
+		}, nil
+	}
+	defer conn.Close()
+
+	// Create SMTP client
+	client, err := smtp.NewClient(conn, recipientHex)
+	if err != nil {
+		return &QuotaCheckResult{
+			CanSend:       false,
+			ErrorMessage:  fmt.Sprintf("SMTP connection failed: %v", err),
+			RecipientAddr: recipientEmail,
+			MessageSizeMB: messageSizeMB,
+		}, nil
+	}
+	defer client.Close()
+
+	// Send EHLO
+	ourAddr := hex.EncodeToString(s.config.PublicKey) + "@yggmail"
+	if err := client.Hello(hex.EncodeToString(s.config.PublicKey)); err != nil {
+		return &QuotaCheckResult{
+			CanSend:       false,
+			ErrorMessage:  fmt.Sprintf("EHLO failed: %v", err),
+			RecipientAddr: recipientEmail,
+			MessageSizeMB: messageSizeMB,
+		}, nil
+	}
+
+	// Check if SIZE extension is supported
+	sizeSupported, sizeParam := client.Extension("SIZE")
+	if !sizeSupported {
+		s.logger.Printf("WARNING: Recipient %s does not support SIZE extension, cannot check quota", recipientHex[:8])
+		// If SIZE not supported, we can't check quota - allow sending
+		// The quota will be checked during actual DATA transfer
+		return &QuotaCheckResult{
+			CanSend:       true,
+			ErrorMessage:  "",
+			RecipientAddr: recipientEmail,
+			MessageSizeMB: messageSizeMB,
+		}, nil
+	}
+
+	s.logger.Printf("Recipient %s supports SIZE extension (max=%s)", recipientHex[:8], sizeParam)
+
+	// Try MAIL FROM with SIZE parameter - this will trigger quota check on recipient
+	mailOpts := &smtp.MailOptions{
+		Size: int(messageSizeBytes),
+	}
+
+	err = client.Mail(ourAddr, mailOpts)
+	if err != nil {
+		// Check if it's a quota error (552 code)
+		if smtpErr, ok := err.(*smtp.SMTPError); ok {
+			if smtpErr.Code == 552 {
+				// Quota exceeded!
+				s.logger.Printf("Recipient %s quota exceeded: %s", recipientHex[:8], smtpErr.Message)
+				return &QuotaCheckResult{
+					CanSend:       false,
+					ErrorMessage:  fmt.Sprintf("Recipient quota exceeded: %s", smtpErr.Message),
+					RecipientAddr: recipientEmail,
+					MessageSizeMB: messageSizeMB,
+				}, nil
+			}
+		}
+		// Other error - treat as "cannot send"
+		return &QuotaCheckResult{
+			CanSend:       false,
+			ErrorMessage:  fmt.Sprintf("Recipient rejected message: %v", err),
+			RecipientAddr: recipientEmail,
+			MessageSizeMB: messageSizeMB,
+		}, nil
+	}
+
+	// Success! Recipient has enough quota
+	// Reset the transaction (we're not actually sending yet)
+	client.Reset()
+
+	s.logger.Printf("Recipient %s has sufficient quota for message (%.2f MB)", recipientHex[:8], messageSizeMB)
+	return &QuotaCheckResult{
+		CanSend:       true,
+		ErrorMessage:  "",
+		RecipientAddr: recipientEmail,
+		MessageSizeMB: messageSizeMB,
 	}, nil
 }
 

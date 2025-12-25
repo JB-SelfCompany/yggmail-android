@@ -15,16 +15,20 @@ import (
 
 	"github.com/emersion/go-imap"
 	"github.com/emersion/go-imap/backend"
-	"github.com/neilalexander/yggmail/internal/config"
-	"github.com/neilalexander/yggmail/internal/storage"
-	"github.com/neilalexander/yggmail/internal/utils"
+	"github.com/JB-SelfCompany/yggmail/internal/config"
+	"github.com/JB-SelfCompany/yggmail/internal/logging"
+	"github.com/JB-SelfCompany/yggmail/internal/storage"
+	"github.com/JB-SelfCompany/yggmail/internal/storage/filestore"
+	"github.com/JB-SelfCompany/yggmail/internal/utils"
 )
 
 type Backend struct {
-	Config  *config.Config
-	Log     *log.Logger
-	Storage storage.Storage
-	Server  *IMAPServer
+	Config          *config.Config
+	Log             *log.Logger
+	Storage         storage.Storage
+	Server          *IMAPServer
+	FileStore       *filestore.FileStore
+	LargeMailLogger *logging.LargeMailLogger
 }
 
 func (b *Backend) Login(conn *imap.ConnInfo, username, password string) (backend.User, error) {

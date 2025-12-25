@@ -25,13 +25,15 @@ import (
 	"github.com/fatih/color"
 	"golang.org/x/term"
 
-	"github.com/neilalexander/yggmail/internal/config"
-	"github.com/neilalexander/yggmail/internal/imapserver"
-	"github.com/neilalexander/yggmail/internal/smtpsender"
-	"github.com/neilalexander/yggmail/internal/smtpserver"
-	"github.com/neilalexander/yggmail/internal/storage/sqlite3"
-	"github.com/neilalexander/yggmail/internal/transport"
-	"github.com/neilalexander/yggmail/internal/utils"
+	"github.com/JB-SelfCompany/yggmail/internal/config"
+	"github.com/JB-SelfCompany/yggmail/internal/imapserver"
+	"github.com/JB-SelfCompany/yggmail/internal/logging"
+	"github.com/JB-SelfCompany/yggmail/internal/smtpsender"
+	"github.com/JB-SelfCompany/yggmail/internal/smtpserver"
+	"github.com/JB-SelfCompany/yggmail/internal/storage/filestore"
+	"github.com/JB-SelfCompany/yggmail/internal/storage/sqlite3"
+	"github.com/JB-SelfCompany/yggmail/internal/transport"
+	"github.com/JB-SelfCompany/yggmail/internal/utils"
 
 	"golang.org/x/crypto/bcrypt"
 )
@@ -57,7 +59,7 @@ func main() {
 	smtpaddr := flag.String("smtp", "localhost:1025", "SMTP listen address")
 	imapaddr := flag.String("imap", "localhost:1143", "IMAP listen address")
 	multicast := flag.Bool("multicast", false, "Connect to Yggdrasil peers on your LAN")
-        mcastregexp := flag.String("mcastregexp", ".*", "Regexp for multicast")
+        _ = flag.String("mcastregexp", ".*", "Regexp for multicast")
 	password := flag.Bool("password", false, "Set a new IMAP/SMTP password")
 	passwordhash := flag.String("passwordhash", "", "Set a new IMAP/SMTP password (hash)")
 	flag.Var(&peerAddrs, "peer", "Connect to a specific Yggdrasil static peer (this option can be given more than once)")
@@ -109,6 +111,20 @@ func main() {
 			panic(err)
 		}
 	}
+
+	// Database migrations are now run automatically in NewSQLite3StorageStorage()
+
+	// Initialize FileStore for large message files
+	mailDataPath := *database + ".maildata"
+	fileStore, err := filestore.NewFileStore(mailDataPath)
+	if err != nil {
+		panic(fmt.Errorf("failed to initialize file store: %w", err))
+	}
+	log.Printf("Initialized file store at %q\n", mailDataPath)
+
+	// Initialize LargeMailLogger
+	largeMailLogger := logging.NewLargeMailLogger()
+	log.Println("Initialized large mail logger")
 
 	switch {
 	case password != nil && *password:
@@ -175,18 +191,23 @@ func main() {
 		PrivateKey: sk,
 	}
 
-	transport, err := transport.NewYggdrasilTransport(rawlog, sk, pk, peerAddrs, *multicast, *mcastregexp)
+	// Initialize transport with default power state (not active, not charging)
+	transport, err := transport.NewYggdrasilTransport(rawlog, sk, pk, peerAddrs, false, false)
 	if err != nil {
 		panic(err)
 	}
 
 	queues := smtpsender.NewQueues(cfg, log, transport, storage)
+	queues.FileStore = fileStore
+	queues.LargeMailLogger = largeMailLogger
 	var notify *imapserver.IMAPNotify
 
 	imapBackend := &imapserver.Backend{
-		Log:     log,
-		Config:  cfg,
-		Storage: storage,
+		Log:             log,
+		Config:          cfg,
+		Storage:         storage,
+		FileStore:       fileStore,
+		LargeMailLogger: largeMailLogger,
 	}
 
 	_, notify, err = imapserver.NewIMAPServer(imapBackend, *imapaddr, true)
@@ -197,18 +218,20 @@ func main() {
 
 	go func() {
 		localBackend := &smtpserver.Backend{
-			Log:     log,
-			Mode:    smtpserver.BackendModeInternal,
-			Config:  cfg,
-			Storage: storage,
-			Queues:  queues,
-			Notify:  notify,
+			Log:             log,
+			Mode:            smtpserver.BackendModeInternal,
+			Config:          cfg,
+			Storage:         storage,
+			Queues:          queues,
+			Notify:          notify,
+			FileStore:       fileStore,
+			LargeMailLogger: largeMailLogger,
 		}
 
 		localServer := smtp.NewServer(localBackend)
 		localServer.Addr = *smtpaddr
 		localServer.Domain = hex.EncodeToString(pk)
-		localServer.MaxMessageBytes = 1024 * 1024 * 32
+		localServer.MaxMessageBytes = 500 * 1024 * 1024 // 500 MB for large file support
 		localServer.MaxRecipients = 50
 		localServer.AllowInsecureAuth = true
 		localServer.EnableAuth(sasl.Login, func(conn *smtp.Conn) sasl.Server {
@@ -226,17 +249,19 @@ func main() {
 
 	go func() {
 		overlayBackend := &smtpserver.Backend{
-			Log:     log,
-			Mode:    smtpserver.BackendModeExternal,
-			Config:  cfg,
-			Storage: storage,
-			Queues:  queues,
-			Notify:  notify,
+			Log:             log,
+			Mode:            smtpserver.BackendModeExternal,
+			Config:          cfg,
+			Storage:         storage,
+			Queues:          queues,
+			Notify:          notify,
+			FileStore:       fileStore,
+			LargeMailLogger: largeMailLogger,
 		}
 
 		overlayServer := smtp.NewServer(overlayBackend)
 		overlayServer.Domain = hex.EncodeToString(pk)
-		overlayServer.MaxMessageBytes = 1024 * 1024 * 32
+		overlayServer.MaxMessageBytes = 500 * 1024 * 1024 // 500 MB for large file support
 		overlayServer.MaxRecipients = 50
 		overlayServer.AuthDisabled = true
 

@@ -116,7 +116,8 @@ func (t *YggdrasilTransport) Dial(host string) (net.Conn, error) {
 	}
 	// Needed to kick the stream so the other side "speaks first"
 	// This is critical for SMTP protocol where server must send greeting first
-	_, err = c.Write([]byte(" "))
+	// The server will consume and ignore this byte via kickByteConn wrapper
+	_, err = c.Write([]byte{0})
 	if err != nil {
 		c.Close()
 		return nil, err
@@ -125,7 +126,21 @@ func (t *YggdrasilTransport) Dial(host string) (net.Conn, error) {
 }
 
 func (t *YggdrasilTransport) Listener() net.Listener {
-	return t.yggquic
+	return &kickByteListener{Listener: t.yggquic}
+}
+
+// kickByteListener wraps a net.Listener to consume kick bytes from accepted connections.
+type kickByteListener struct {
+	net.Listener
+}
+
+func (l *kickByteListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	// Wrap connection to consume the kick byte on first read
+	return newKickByteConn(conn), nil
 }
 
 // GetCore returns the underlying Yggdrasil core for peer management

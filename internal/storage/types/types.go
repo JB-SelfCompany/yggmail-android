@@ -13,7 +13,9 @@ import "time"
 type Mail struct {
 	Mailbox  string
 	ID       int
-	Mail     []byte
+	Mail     []byte  // NULL for large messages stored in files
+	MailFile string  // Relative path to .eml file (for large messages)
+	Size     int64   // Size in bytes (for both BLOB and file storage)
 	Date     time.Time
 	Seen     bool
 	Answered bool
@@ -26,3 +28,10 @@ type QueuedMail struct {
 	From string
 	Rcpt string
 }
+
+// Constants for large message handling
+const (
+	SmallMessageThreshold = 10 * 1024 * 1024   // 10 MB - threshold for storing in DB vs file
+	LargeMessageThreshold = 500 * 1024 * 1024  // 500 MB - maximum message size
+	ChunkSize             = 128 * 1024         // 128 KB - chunk size for streaming I/O
+)

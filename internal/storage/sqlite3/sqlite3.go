@@ -13,6 +13,7 @@ import (
 	"fmt"
 
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/JB-SelfCompany/yggmail/internal/storage/filestore"
 	"go.uber.org/atomic"
 )
 
@@ -30,6 +31,13 @@ func NewSQLite3StorageStorage(filename string) (*SQLite3Storage, error) {
 	if err != nil {
 		return nil, fmt.Errorf("sql.Open: %w", err)
 	}
+
+	// Run migrations BEFORE creating prepared statements
+	// This ensures that mail_file and size columns exist if restoring from old backup
+	if err := RunMigrations(db); err != nil {
+		return nil, fmt.Errorf("RunMigrations: %w", err)
+	}
+
 	s := &SQLite3Storage{
 		db: db,
 		writer: &Writer{
@@ -112,4 +120,21 @@ func (w *Writer) run() {
 		}
 		close(task.wait)
 	}
+}
+
+// RunMigrations executes database schema migrations
+// This is a wrapper around the standalone RunMigrations function
+func (s *SQLite3Storage) RunMigrations() error {
+	return RunMigrations(s.db)
+}
+
+// MigrateLargeMessagesToFiles migrates large messages from BLOB to file storage
+// This is a wrapper around the standalone MigrateLargeMessagesToFiles function
+func (s *SQLite3Storage) MigrateLargeMessagesToFiles(fs *filestore.FileStore, threshold int64) error {
+	return MigrateLargeMessagesToFiles(s.db, fs, threshold)
+}
+
+// GetStorageStatistics returns storage statistics
+func (s *SQLite3Storage) GetStorageStatistics() (*StorageStats, error) {
+	return GetStorageStats(s.db)
 }

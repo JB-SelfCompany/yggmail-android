@@ -8,13 +8,20 @@
 
 package storage
 
-import "github.com/neilalexander/yggmail/internal/storage/types"
+import (
+	"io"
+
+	"github.com/JB-SelfCompany/yggmail/internal/storage/filestore"
+	"github.com/JB-SelfCompany/yggmail/internal/storage/types"
+)
 
 type Storage interface {
 	ConfigGet(key string) (string, error)
 	ConfigSet(key, value string) error
 	ConfigSetPassword(password string) error
 	ConfigTryPassword(password string) (bool, error)
+	ConfigGetUnreadQuota() (int64, error)
+	ConfigSetUnreadQuota(bytes int64) error
 
 	MailboxSelect(mailbox string) (bool, error)
 	MailNextID(mailbox string) (int, error)
@@ -27,17 +34,25 @@ type Storage interface {
 	MailboxSubscribe(name string, subscribed bool) error
 
 	MailCreate(mailbox string, data []byte) (int, error)
+	MailCreateFromStream(mailbox string, reader io.Reader, fs *filestore.FileStore) (int, error)
 	MailSelect(mailbox string, id int) (int, *types.Mail, error)
 	MailSearch(mailbox string) ([]uint32, error)
 	MailUpdateFlags(mailbox string, id int, seen, answered, flagged, deleted bool) error
 	MailDelete(mailbox string, id int) error
 	MailExpunge(mailbox string) error
+	MailExpungeWithFileStore(mailbox string, fs *filestore.FileStore) error
 	MailCount(mailbox string) (int, error)
 	MailMove(mailbox string, id int, destination string) error
+	MailMoveWithFileStore(mailbox string, id int, destination string, fs *filestore.FileStore) error
+	MailGetAllFilePaths() (map[string]bool, error)
+	MailGetUnreadSize() (int64, error)
+	MailGetUnreadSizeForMailbox(mailbox string) (int64, error)
 
 	QueueListDestinations() ([]string, error)
 	QueueMailIDsForDestination(destination string) ([]types.QueuedMail, error)
 	QueueInsertDestinationForID(destination string, id int, from, rcpt string) error
 	QueueDeleteDestinationForID(destination string, id int) error
 	QueueSelectIsMessagePendingSend(mailbox string, id int) (bool, error)
+
+	Close() error
 }

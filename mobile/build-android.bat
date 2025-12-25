@@ -40,7 +40,7 @@ REM Build for all architectures (larger file, better compatibility)
 echo Building for all architectures (arm, arm64, 386, amd64)...
 echo Note: Using -checklinkname=0 to workaround wlynxg/anet compatibility issue
 echo.
-gomobile bind -target=android -androidapi 23 -ldflags="-checklinkname=0" -o yggmail.aar github.com/neilalexander/yggmail/mobile
+gomobile bind -target=android -androidapi 23 -ldflags="-checklinkname=0" -o yggmail.aar github.com/JB-SelfCompany/yggmail/mobile
 
 REM Save error level immediately
 set BUILD_RESULT=%ERRORLEVEL%

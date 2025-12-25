@@ -9,10 +9,12 @@
 package smtpsender
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"math/rand"
@@ -22,10 +24,13 @@ import (
 	"time"
 
 	"github.com/emersion/go-smtp"
-	"github.com/neilalexander/yggmail/internal/config"
-	"github.com/neilalexander/yggmail/internal/storage"
-	"github.com/neilalexander/yggmail/internal/transport"
-	"github.com/neilalexander/yggmail/internal/utils"
+	"github.com/JB-SelfCompany/yggmail/internal/config"
+	"github.com/JB-SelfCompany/yggmail/internal/logging"
+	"github.com/JB-SelfCompany/yggmail/internal/storage"
+	"github.com/JB-SelfCompany/yggmail/internal/storage/filestore"
+	"github.com/JB-SelfCompany/yggmail/internal/storage/types"
+	"github.com/JB-SelfCompany/yggmail/internal/transport"
+	"github.com/JB-SelfCompany/yggmail/internal/utils"
 	"go.uber.org/atomic"
 )
 
@@ -43,12 +48,14 @@ const (
 )
 
 type Queues struct {
-	Config    *config.Config
-	Log       *log.Logger
-	Transport transport.Transport
-	Storage   storage.Storage
-	queues    sync.Map // servername -> *Queue
-	triggerCh chan struct{} // Channel to trigger immediate queue processing
+	Config          *config.Config
+	Log             *log.Logger
+	Transport       transport.Transport
+	Storage         storage.Storage
+	FileStore       *filestore.FileStore
+	LargeMailLogger *logging.LargeMailLogger
+	queues          sync.Map // servername -> *Queue
+	triggerCh       chan struct{} // Channel to trigger immediate queue processing
 }
 
 func NewQueues(config *config.Config, log *log.Logger, transport transport.Transport, storage storage.Storage) *Queues {
@@ -84,9 +91,27 @@ func (qs *Queues) manager() {
 }
 
 func (qs *Queues) QueueFor(from string, rcpts []string, content []byte) error {
-	pid, err := qs.Storage.MailCreate("Outbox", content)
-	if err != nil {
-		return fmt.Errorf("q.queues.Storage.MailCreate: %w", err)
+	var pid int
+	var err error
+
+	// Check if content is large enough to use file storage
+	if int64(len(content)) > types.SmallMessageThreshold && qs.FileStore != nil {
+		// Large message - use streaming storage
+		fmt.Printf("[QueueFor] Large message (%d bytes, %.2f MB) - using file storage\n",
+			len(content), float64(len(content))/(1024*1024))
+		reader := bytes.NewReader(content)
+		pid, err = qs.Storage.MailCreateFromStream("Outbox", reader, qs.FileStore)
+		if err != nil {
+			return fmt.Errorf("q.queues.Storage.MailCreateFromStream: %w", err)
+		}
+	} else {
+		// Small message - use BLOB storage
+		fmt.Printf("[QueueFor] Small message (%d bytes, %.2f MB) - using BLOB storage\n",
+			len(content), float64(len(content))/(1024*1024))
+		pid, err = qs.Storage.MailCreate("Outbox", content)
+		if err != nil {
+			return fmt.Errorf("q.queues.Storage.MailCreate: %w", err)
+		}
 	}
 
 	for _, rcpt := range rcpts {
@@ -113,6 +138,77 @@ func (qs *Queues) QueueFor(from string, rcpts []string, content []byte) error {
 		// Successfully triggered immediate processing
 	default:
 		// Channel already has a trigger pending, skip
+	}
+
+	return nil
+}
+
+// QueueForStream queues an email message from a reader for delivery to recipients
+// This method supports streaming large messages without loading them entirely into memory
+func (qs *Queues) QueueForStream(from string, rcpts []string, reader io.Reader) error {
+	// Peek data to determine if this is a small or large message
+	peekBuf := new(bytes.Buffer)
+	peekBuf.Grow(int(types.SmallMessageThreshold) + 1)
+
+	teeReader := io.TeeReader(reader, peekBuf)
+	limitedReader := io.LimitReader(teeReader, int64(types.SmallMessageThreshold)+1)
+
+	peekedData := make([]byte, types.SmallMessageThreshold+1)
+	n, err := io.ReadFull(limitedReader, peekedData)
+	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
+		return fmt.Errorf("failed to peek message data: %w", err)
+	}
+	peekedData = peekedData[:n]
+
+	isLarge := n > int(types.SmallMessageThreshold)
+
+	// Create mail in Outbox
+	var pid int
+	if isLarge && qs.FileStore != nil {
+		// Large message - use streaming storage
+		fmt.Printf("[QueueForStream] Creating large message: peekedDataLen=%d bytes\n", len(peekedData))
+		fullReader := io.MultiReader(bytes.NewReader(peekedData), reader)
+		pid, err = qs.Storage.MailCreateFromStream("Outbox", fullReader, qs.FileStore)
+		if err != nil {
+			return fmt.Errorf("qs.Storage.MailCreateFromStream: %w", err)
+		}
+		qs.Log.Printf("Queued large message (MailID=%d, Size~%d MB)", pid, n/(1024*1024))
+	} else {
+		// Small message - read all into memory
+		var b bytes.Buffer
+		b.Write(peekedData)
+		if _, err := io.Copy(&b, reader); err != nil {
+			return fmt.Errorf("failed to read message data: %w", err)
+		}
+		pid, err = qs.Storage.MailCreate("Outbox", b.Bytes())
+		if err != nil {
+			return fmt.Errorf("qs.Storage.MailCreate: %w", err)
+		}
+	}
+
+	// Queue for each recipient
+	for _, rcpt := range rcpts {
+		addr, err := mail.ParseAddress(rcpt)
+		if err != nil {
+			return fmt.Errorf("mail.ParseAddress: %w", err)
+		}
+		pk, err := utils.ParseAddress(addr.Address)
+		if err != nil {
+			return fmt.Errorf("parseAddress: %w", err)
+		}
+		host := hex.EncodeToString(pk)
+
+		if err := qs.Storage.QueueInsertDestinationForID(host, pid, from, rcpt); err != nil {
+			return fmt.Errorf("qs.Storage.QueueInsertDestinationForID: %w", err)
+		}
+
+		_, _ = qs.queueFor(host)
+	}
+
+	// Trigger immediate queue processing
+	select {
+	case qs.triggerCh <- struct{}{}:
+	default:
 	}
 
 	return nil
@@ -223,10 +319,25 @@ func (q *Queue) run() {
 			// Local delivery - avoid network connection race condition
 			q.queues.Log.Println("Local delivery from", ref.From, "to", q.destination, "(self-send)")
 
-			// Directly store the mail in the Inbox
-			if _, err := q.queues.Storage.MailCreate("INBOX", mail.Mail); err != nil {
+			// Directly store the mail in the Inbox - support both file and BLOB
+			var deliveryErr error
+			if mail.MailFile != "" && q.queues.FileStore != nil {
+				// Large message - copy file to INBOX
+				file, err := q.queues.FileStore.ReadMail(mail.MailFile)
+				if err != nil {
+					deliveryErr = fmt.Errorf("failed to read mail file: %w", err)
+				} else {
+					defer file.Close()
+					_, deliveryErr = q.queues.Storage.MailCreateFromStream("INBOX", file, q.queues.FileStore)
+				}
+			} else {
+				// Small message - use BLOB
+				_, deliveryErr = q.queues.Storage.MailCreate("INBOX", mail.Mail)
+			}
+
+			if deliveryErr != nil {
 				q.retryCount++
-				q.queues.Log.Printf("Failed local delivery to %s (retry count: %d): %v\n", q.destination, q.retryCount, err)
+				q.queues.Log.Printf("Failed local delivery to %s (retry count: %d): %v\n", q.destination, q.retryCount, deliveryErr)
 				continue
 			}
 
@@ -238,6 +349,7 @@ func (q *Queue) run() {
 			if remaining, err := q.queues.Storage.QueueSelectIsMessagePendingSend("Outbox", ref.ID); err != nil {
 				q.queues.Log.Printf("Failed to check pending: %v\n", err)
 			} else if !remaining {
+				// Delete from Outbox - this will also delete the file if it's the last reference
 				q.queues.Storage.MailDelete("Outbox", ref.ID)
 			}
 
@@ -250,50 +362,172 @@ func (q *Queue) run() {
 		q.queues.Log.Println("Sending mail from", ref.From, "to", q.destination)
 
 		if err := func() error {
+			// Prepare mail reader (file or BLOB)
+			var mailReader io.ReadCloser
+			var mailSize int64
+			if mail.MailFile != "" && q.queues.FileStore != nil {
+				// Large message - read from file
+				file, err := q.queues.FileStore.ReadMail(mail.MailFile)
+				if err != nil {
+					return fmt.Errorf("failed to read mail file: %w", err)
+				}
+				mailReader = file
+				mailSize = mail.Size
+			} else {
+				// Small message - read from BLOB
+				mailReader = io.NopCloser(bytes.NewReader(mail.Mail))
+				mailSize = int64(len(mail.Mail))
+			}
+			defer mailReader.Close()
+
+			// Start large mail logging if needed
+			var opID string
+			isLarge := mailSize > types.SmallMessageThreshold
+			if isLarge && q.queues.LargeMailLogger != nil {
+				opID = fmt.Sprintf("SND-%s-%d", q.destination[:8], ref.ID)
+				q.queues.LargeMailLogger.StartOperation(opID, ref.ID, mailSize, "SEND")
+			}
+
+			// Establish connection and send
 			conn, err := q.queues.Transport.Dial(q.destination)
 			if err != nil {
+				if isLarge && q.queues.LargeMailLogger != nil {
+					q.queues.LargeMailLogger.EndOperation(opID, false, err.Error())
+				}
 				return fmt.Errorf("q.queues.Transport.Dial: %w", err)
 			}
 			defer conn.Close()
 
 			client, err := smtp.NewClient(conn, q.destination)
 			if err != nil {
+				if isLarge && q.queues.LargeMailLogger != nil {
+					q.queues.LargeMailLogger.EndOperation(opID, false, err.Error())
+				}
 				return fmt.Errorf("smtp.NewClient: %w", err)
 			}
 			defer client.Close()
 
+			// Enable debug logging for SMTP protocol to diagnose SIZE extension issue
+			if false { // Set to true to enable detailed SMTP client protocol logging
+				client.DebugWriter = q.queues.Log.Writer()
+			}
+
 			if err := client.Hello(hex.EncodeToString(q.queues.Config.PublicKey)); err != nil {
 				q.queues.Log.Println("Remote server", q.destination, "did not accept HELLO:", err)
+				if isLarge && q.queues.LargeMailLogger != nil {
+					q.queues.LargeMailLogger.EndOperation(opID, false, err.Error())
+				}
 				return fmt.Errorf("client.Hello: %w", err)
 			}
 
-			if err := client.Mail(ref.From, nil); err != nil {
-				q.queues.Log.Println("Remote server", q.destination, "did not accept MAIL:", err)
+			// DEBUG: Log all extensions received from server
+			q.queues.Log.Printf("DEBUG: Checking extensions after EHLO to %s", q.destination)
+			allExts := []string{}
+			for _, extName := range []string{"SIZE", "8BITMIME", "PIPELINING", "ENHANCEDSTATUSCODES", "AUTH", "STARTTLS"} {
+				supported, param := client.Extension(extName)
+				if supported {
+					if param != "" {
+						allExts = append(allExts, fmt.Sprintf("%s=%s", extName, param))
+					} else {
+						allExts = append(allExts, extName)
+					}
+				}
+			}
+			q.queues.Log.Printf("DEBUG: Server %s extensions: %v", q.destination, allExts)
+
+			// RFC 1870 SIZE extension: Inform recipient of message size
+			// This allows recipient to reject BEFORE data transfer if quota exceeded
+			mailOpts := &smtp.MailOptions{
+				Size: int(mailSize), // int in v0.15.0
+			}
+
+			// Check if server supports SIZE extension (v0.15.0)
+			sizeSupported, sizeParam := client.Extension("SIZE")
+			if sizeSupported {
+				q.queues.Log.Printf("Server %s supports SIZE extension, param=%s", q.destination, sizeParam)
+			} else {
+				q.queues.Log.Printf("WARNING: Server %s does NOT support SIZE extension", q.destination)
+			}
+
+			q.queues.Log.Printf("Sending MAIL FROM with SIZE=%d bytes (%.2f MB) to %s (SIZE supported: %v)",
+				mailSize, float64(mailSize)/(1024*1024), q.destination, sizeSupported)
+
+			if err := client.Mail(ref.From, mailOpts); err != nil {
+				q.queues.Log.Printf("Remote server %s REJECTED MAIL FROM (SIZE check): %v", q.destination, err)
+				if isLarge && q.queues.LargeMailLogger != nil {
+					q.queues.LargeMailLogger.EndOperation(opID, false, err.Error())
+				}
 				return fmt.Errorf("client.Mail: %w", err)
 			}
 
 			if err := client.Rcpt(ref.Rcpt); err != nil {
 				q.queues.Log.Println("Remote server", q.destination, "did not accept RCPT:", err)
+				if isLarge && q.queues.LargeMailLogger != nil {
+					q.queues.LargeMailLogger.EndOperation(opID, false, err.Error())
+				}
 				return fmt.Errorf("client.Rcpt: %w", err)
 			}
 
 			writer, err := client.Data()
 			if err != nil {
+				if isLarge && q.queues.LargeMailLogger != nil {
+					q.queues.LargeMailLogger.EndOperation(opID, false, err.Error())
+				}
 				return fmt.Errorf("client.Data: %w", err)
 			}
 			defer writer.Close()
 
-			if _, err := writer.Write(mail.Mail); err != nil {
-				return fmt.Errorf("writer.Write: %w", err)
+			// Streaming send with chunking and progress logging
+			buffer := make([]byte, types.ChunkSize) // 128 KB chunks
+			totalSent := int64(0)
+			lastLoggedAt := int64(0)
+			const logInterval = 5 * 1024 * 1024 // Log every 5 MB
+
+			for {
+				n, readErr := mailReader.Read(buffer)
+				if n > 0 {
+					if _, writeErr := writer.Write(buffer[:n]); writeErr != nil {
+						if isLarge && q.queues.LargeMailLogger != nil {
+							q.queues.LargeMailLogger.EndOperation(opID, false, writeErr.Error())
+						}
+						return fmt.Errorf("writer.Write: %w", writeErr)
+					}
+					totalSent += int64(n)
+
+					// Log progress every 5 MB for large messages
+					if isLarge && q.queues.LargeMailLogger != nil && totalSent-lastLoggedAt >= logInterval {
+						q.queues.LargeMailLogger.LogMilestone(opID, "sending", totalSent,
+							fmt.Sprintf("Sent %d MB", totalSent/(1024*1024)))
+						lastLoggedAt = totalSent
+					}
+				}
+
+				if readErr == io.EOF {
+					break
+				}
+				if readErr != nil {
+					if isLarge && q.queues.LargeMailLogger != nil {
+						q.queues.LargeMailLogger.EndOperation(opID, false, readErr.Error())
+					}
+					return fmt.Errorf("mailReader.Read: %w", readErr)
+				}
 			}
 
+			// Log final completion for large messages
+			if isLarge && q.queues.LargeMailLogger != nil {
+				q.queues.LargeMailLogger.EndOperation(opID, true, "")
+			}
+
+			// Remove from queue
 			if err := q.queues.Storage.QueueDeleteDestinationForID(q.destination, ref.ID); err != nil {
 				return fmt.Errorf("q.queues.Storage.QueueDeleteDestinationForID: %w", err)
 			}
 
+			// Check if this was the last recipient for this message
 			if remaining, err := q.queues.Storage.QueueSelectIsMessagePendingSend("Outbox", ref.ID); err != nil {
 				return fmt.Errorf("q.queues.Storage.QueueSelectIsMessagePendingSend: %w", err)
 			} else if !remaining {
+				// Last recipient - delete from Outbox (this will also delete the file)
 				return q.queues.Storage.MailDelete("Outbox", ref.ID)
 			}
 
@@ -365,5 +599,7 @@ func isPermanentError(err error) bool {
 	return strings.Contains(errStr, "invalid address") ||
 		strings.Contains(errStr, "mailbox not found") ||
 		strings.Contains(errStr, "permanent failure") ||
-		strings.Contains(errStr, "recipient rejected")
+		strings.Contains(errStr, "recipient rejected") ||
+		strings.Contains(errStr, "552 unread quota exceeded") || // RFC 1870 SIZE quota rejection
+		strings.Contains(errStr, "unread quota exceeded")
 }

@@ -40,7 +40,7 @@ echo Note: Using -checklinkname=0 to workaround wlynxg/anet compatibility issue
 echo.
 
 REM Build for ARM64 only (smaller file, most common architecture)
-gomobile bind -target=android/arm64 -androidapi 23 -ldflags="-checklinkname=0" -o yggmail.aar github.com/neilalexander/yggmail/mobile
+gomobile bind -target=android/arm64 -androidapi 23 -ldflags="-checklinkname=0" -o yggmail.aar github.com/JB-SelfCompany/yggmail/mobile
 
 REM Save error level immediately
 set BUILD_RESULT=%ERRORLEVEL%

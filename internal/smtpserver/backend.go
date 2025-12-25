@@ -14,11 +14,13 @@ import (
 	"log"
 
 	"github.com/emersion/go-smtp"
-	"github.com/neilalexander/yggmail/internal/config"
-	"github.com/neilalexander/yggmail/internal/imapserver"
-	"github.com/neilalexander/yggmail/internal/smtpsender"
-	"github.com/neilalexander/yggmail/internal/storage"
-	"github.com/neilalexander/yggmail/internal/utils"
+	"github.com/JB-SelfCompany/yggmail/internal/config"
+	"github.com/JB-SelfCompany/yggmail/internal/imapserver"
+	"github.com/JB-SelfCompany/yggmail/internal/logging"
+	"github.com/JB-SelfCompany/yggmail/internal/smtpsender"
+	"github.com/JB-SelfCompany/yggmail/internal/storage"
+	"github.com/JB-SelfCompany/yggmail/internal/storage/filestore"
+	"github.com/JB-SelfCompany/yggmail/internal/utils"
 )
 
 type BackendMode int
@@ -29,13 +31,15 @@ const (
 )
 
 type Backend struct {
-	Mode         BackendMode
-	Log          *log.Logger
-	Config       *config.Config
-	Queues       *smtpsender.Queues
-	Storage      storage.Storage
-	Notify       *imapserver.IMAPNotify
-	MailCallback MailCallback
+	Mode            BackendMode
+	Log             *log.Logger
+	Config          *config.Config
+	Queues          *smtpsender.Queues
+	Storage         storage.Storage
+	Notify          *imapserver.IMAPNotify
+	MailCallback    MailCallback
+	FileStore       *filestore.FileStore
+	LargeMailLogger *logging.LargeMailLogger
 }
 
 // MailCallback interface for mail event notifications
@@ -98,7 +102,7 @@ func (b *Backend) AnonymousLogin(state *smtp.ConnectionState) (smtp.Session, err
 			return nil, fmt.Errorf("You are not who you claim to be")
 		}
 
-		b.Log.Println("Incoming SMTP session from", remote)
+		b.Log.Printf("Incoming SMTP session from %s (server state: %+v)", remote, state)
 		return &SessionRemote{
 			backend: b,
 			state:   state,

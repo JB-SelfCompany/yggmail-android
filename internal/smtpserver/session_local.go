@@ -17,7 +17,7 @@ import (
 
 	"github.com/emersion/go-message"
 	"github.com/emersion/go-smtp"
-	"github.com/neilalexander/yggmail/internal/utils"
+	"github.com/JB-SelfCompany/yggmail/internal/utils"
 )
 
 type SessionLocal struct {
@@ -49,11 +49,28 @@ func (s *SessionLocal) Rcpt(to string) error {
 }
 
 func (s *SessionLocal) Data(r io.Reader) error {
-	m, err := message.Read(r)
+	// Simply read all data and queue it
+	// Don't do complex MultiReader - just read, add headers, and queue
+	var b bytes.Buffer
+	written, err := io.Copy(&b, r)
+	if err != nil {
+		return fmt.Errorf("failed to read message data: %w", err)
+	}
+
+	fmt.Printf("[SessionLocal] Data() received: %d bytes (%.2f MB)\n", written, float64(written)/(1024*1024))
+
+	// Parse message to add headers
+	m, err := message.Read(bytes.NewReader(b.Bytes()))
 	if err != nil {
 		return fmt.Errorf("message.Read: %w", err)
 	}
 
+	// Log Content-Type and Content-Transfer-Encoding to understand message structure
+	contentType := m.Header.Get("Content-Type")
+	encoding := m.Header.Get("Content-Transfer-Encoding")
+	fmt.Printf("[SessionLocal] Content-Type: %s, Encoding: %s\n", contentType, encoding)
+
+	// Add Yggmail-specific headers
 	remoteAddr := "unknown"
 	if s.state != nil && s.state.RemoteAddr != nil {
 		remoteAddr = s.state.RemoteAddr.String()
@@ -71,16 +88,27 @@ func (s *SessionLocal) Data(r io.Reader) error {
 		)
 	}
 
-	var b bytes.Buffer
-	if err := m.WriteTo(&b); err != nil {
-		return fmt.Errorf("m.WriteTo: %w", err)
+	// Rebuild message with new headers
+	var finalData bytes.Buffer
+	fields := m.Header.Fields()
+	for fields.Next() {
+		finalData.WriteString(fields.Key())
+		finalData.WriteString(": ")
+		finalData.WriteString(fields.Value())
+		finalData.WriteString("\r\n")
+	}
+	finalData.WriteString("\r\n")
+	if _, err := io.Copy(&finalData, m.Body); err != nil {
+		return fmt.Errorf("failed to copy body: %w", err)
 	}
 
-	if err := s.backend.Queues.QueueFor(s.from, s.rcpt, b.Bytes()); err != nil {
+	fmt.Printf("[SessionLocal] Final message size: %d bytes (%.2f MB)\n", finalData.Len(), float64(finalData.Len())/(1024*1024))
+
+	// Queue the message using QueueFor (data already in memory)
+	if err := s.backend.Queues.QueueFor(s.from, s.rcpt, finalData.Bytes()); err != nil {
 		return fmt.Errorf("s.backend.Queues.QueueFor: %w", err)
 	}
-
-	s.backend.Log.Println("Queued mail for", s.rcpt)
+	s.backend.Log.Printf("Queued mail for %v (Size: %.2f MB)", s.rcpt, float64(finalData.Len())/(1024*1024))
 
 	return nil
 }

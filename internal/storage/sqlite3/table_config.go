@@ -92,3 +92,31 @@ func (t *TableConfig) ConfigTryPassword(password string) (bool, error) {
 	}
 	return false, err
 }
+
+// ConfigGetUnreadQuota returns the unread messages quota in bytes
+// Returns default of 10 MB if not set
+func (t *TableConfig) ConfigGetUnreadQuota() (int64, error) {
+	value, err := t.ConfigGet("unread_quota_bytes")
+	if err != nil {
+		return 0, fmt.Errorf("failed to get unread quota: %w", err)
+	}
+	if value == "" {
+		// Default: 10 MB
+		return 10 * 1024 * 1024, nil
+	}
+
+	var quota int64
+	if _, err := fmt.Sscanf(value, "%d", &quota); err != nil {
+		return 0, fmt.Errorf("failed to parse quota value: %w", err)
+	}
+	return quota, nil
+}
+
+// ConfigSetUnreadQuota sets the unread messages quota in bytes
+func (t *TableConfig) ConfigSetUnreadQuota(bytes int64) error {
+	if bytes < 0 {
+		return fmt.Errorf("quota cannot be negative")
+	}
+	value := fmt.Sprintf("%d", bytes)
+	return t.ConfigSet("unread_quota_bytes", value)
+}

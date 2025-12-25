@@ -12,7 +12,7 @@ import (
 	"database/sql"
 	"fmt"
 
-	"github.com/neilalexander/yggmail/internal/storage/types"
+	"github.com/JB-SelfCompany/yggmail/internal/storage/types"
 )
 
 type TableQueue struct {

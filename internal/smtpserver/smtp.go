@@ -10,7 +10,7 @@ package smtpserver
 
 import (
 	"github.com/emersion/go-smtp"
-	"github.com/neilalexander/yggmail/internal/imapserver"
+	"github.com/JB-SelfCompany/yggmail/internal/imapserver"
 )
 
 type SMTPServer struct {
@@ -20,8 +20,11 @@ type SMTPServer struct {
 }
 
 func NewSMTPServer(backend smtp.Backend, notify *imapserver.IMAPNotify) *SMTPServer {
+	srv := smtp.NewServer(backend)
+	// Allow large messages up to 500 MB
+	srv.MaxMessageBytes = 500 * 1024 * 1024
 	s := &SMTPServer{
-		server:  smtp.NewServer(backend),
+		server:  srv,
 		backend: backend,
 		notify:  notify,
 	}

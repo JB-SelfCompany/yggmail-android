@@ -8,7 +8,7 @@ RUN go build -o /src/yggmail ./cmd/yggmail
 
 FROM docker.io/alpine
 
-LABEL org.opencontainers.image.source=https://github.com/neilalexander/yggmail
+LABEL org.opencontainers.image.source=https://github.com/JB-SelfCompany/yggmail
 LABEL org.opencontainers.image.description=Yggmail
 LABEL org.opencontainers.image.licenses=MPL-2.0
 
