@@ -433,6 +433,17 @@ func (t *TableMails) MailMove(mailbox string, id int, destination string) error 
 
 func (t *TableMails) MailMoveWithFileStore(mailbox string, id int, destination string, fs *filestore.FileStore) error {
 	return t.writer.Do(t.db, nil, func(txn *sql.Tx) error {
+		// Check if mail already exists in destination with same ID
+		var existingMailbox string
+		err := t.db.QueryRow("SELECT mailbox FROM mails WHERE mailbox = ? AND id = ?", destination, id).Scan(&existingMailbox)
+		if err == nil {
+			// Mail already exists in destination - nothing to do
+			fmt.Printf("[TableMails] MailMoveWithFileStore: mail %d already exists in %s, skipping move\n", id, destination)
+			return nil
+		} else if err != sql.ErrNoRows {
+			return fmt.Errorf("failed to check existing mail: %w", err)
+		}
+
 		// If fileStore is provided, move the file first
 		if fs != nil {
 			// Get current mail_file path
@@ -461,7 +472,7 @@ func (t *TableMails) MailMoveWithFileStore(mailbox string, id int, destination s
 		}
 
 		// Update mailbox
-		_, err := t.moveMail.Exec(destination, mailbox, id)
+		_, err = t.moveMail.Exec(destination, mailbox, id)
 		return err
 	})
 }

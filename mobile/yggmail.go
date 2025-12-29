@@ -233,7 +233,7 @@ func (s *YggmailService) Initialize() error {
 	s.logger.Printf("Mail address: %s@%s\n", hex.EncodeToString(pk), utils.Domain)
 
 	// Create default mailboxes
-	for _, name := range []string{"INBOX", "Outbox"} {
+	for _, name := range []string{"INBOX", "Outbox", "Sent"} {
 		if err := s.storage.MailboxCreate(name); err != nil {
 			return fmt.Errorf("failed to create mailbox %s: %w", name, err)
 		}
