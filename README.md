@@ -14,7 +14,7 @@ Yggmail is a single-binary all-in-one mail transfer agent which sends and receiv
 * All mail exchange traffic between any two Yggmail nodes is always end-to-end encrypted without exception;
 * Yggdrasil and Yggmail nodes on the same network are discovered automatically using multicast or you can configure a static Yggdrasil peer.
 
-Email addresses are based on your public key, like `89cd1ea25d99b8ccf29e454280313128c234ffb82aa0eb2e3496f6f156d063d0@yggmail`.
+Email addresses are based on your public key, like `89cd1ea25d99b8ccf29e454280313128c234ffb82aa0eb2e3496f6f156d063d0@yggmail`. For email clients with strict domain validation (e.g., Mailspring), you can also use `@yggmail.local` as an alias.
 
 ## Why?
 
@@ -122,6 +122,27 @@ There are a few important notes:
 * You can only email other Yggmail users, not regular email addresses on the public Internet;
 * You may need to configure your client to allow "insecure" or "plaintext" authentication to IMAP/SMTP — this is because we don't support SSL/TLS on the IMAP/SMTP listeners yet;
 * Maximum message size is 500 MB (messages larger than 1MB are stored on filesystem via FileStore).
+
+## Troubleshooting
+
+### Email Client Domain Validation Issues
+
+Some email clients (e.g., Mailspring, certain versions of Outlook) have strict domain validation and may reject the `yggmail` domain as "unsupported" or "invalid".
+
+**Solution:** Use `@yggmail.local` instead of `@yggmail` when configuring your email client:
+
+**Example (Mailspring):**
+```
+Email address: 89cd1ea25d99b8ccf29e454280313128c234ffb82aa0eb2e3496f6f156d063d0@yggmail.local
+IMAP Server:   localhost:1143
+SMTP Server:   localhost:1025
+Password:      [your password]
+```
+
+**How it works:**
+- Yggmail accepts both `@yggmail` and `@yggmail.local` domains for authentication and mail delivery
+- All outgoing mail still uses `@yggmail` for network compatibility with other nodes
+- The `.local` suffix is purely for client compatibility and doesn't affect functionality
 
 ## Android Library Build
 

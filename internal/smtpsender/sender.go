@@ -296,6 +296,17 @@ func (q *Queue) run() {
 			continue
 		}
 
+		// Check if message was deleted by user - remove from queue immediately
+		if mail.Deleted {
+			q.queues.Log.Printf("Mail %d was deleted by user - removing from queue\n", ref.ID)
+			q.queues.Storage.QueueDeleteDestinationForID(q.destination, ref.ID)
+			if remaining, err := q.queues.Storage.QueueSelectIsMessagePendingSend("Outbox", ref.ID); err == nil && !remaining {
+				// Last recipient - trigger expunge to physically delete the message
+				q.queues.Storage.MailExpunge("Outbox")
+			}
+			continue
+		}
+
 		// Check if message has been undeliverable for too long
 		messageAge := time.Since(mail.Date)
 		if messageAge > time.Duration(UNDELIVERABLE_TIMEOUT_SECS)*time.Second {
@@ -614,6 +625,6 @@ func isPermanentError(err error) bool {
 		strings.Contains(errStr, "mailbox not found") ||
 		strings.Contains(errStr, "permanent failure") ||
 		strings.Contains(errStr, "recipient rejected") ||
-		strings.Contains(errStr, "552 unread quota exceeded") || // RFC 1870 SIZE quota rejection
-		strings.Contains(errStr, "unread quota exceeded")
+		strings.Contains(errStr, "552") || // All 552 errors (SIZE limit, quota exceeded, etc.) are permanent per RFC
+		strings.Contains(errStr, "message size") // Additional check for message size limit errors
 }

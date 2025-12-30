@@ -433,47 +433,79 @@ func (t *TableMails) MailMove(mailbox string, id int, destination string) error 
 
 func (t *TableMails) MailMoveWithFileStore(mailbox string, id int, destination string, fs *filestore.FileStore) error {
 	return t.writer.Do(t.db, nil, func(txn *sql.Tx) error {
-		// Check if mail already exists in destination with same ID
-		var existingMailbox string
-		err := t.db.QueryRow("SELECT mailbox FROM mails WHERE mailbox = ? AND id = ?", destination, id).Scan(&existingMailbox)
-		if err == nil {
-			// Mail already exists in destination - nothing to do
-			fmt.Printf("[TableMails] MailMoveWithFileStore: mail %d already exists in %s, skipping move\n", id, destination)
-			return nil
-		} else if err != sql.ErrNoRows {
-			return fmt.Errorf("failed to check existing mail: %w", err)
+		// Read mail data from source
+		var mail sql.NullString
+		var mailFile sql.NullString
+		var size int64
+		var datetime int64
+		var seen, answered, flagged, deleted bool
+
+		err := t.db.QueryRow(`
+			SELECT mail, mail_file, size, datetime, seen, answered, flagged, deleted
+			FROM mails WHERE mailbox = ? AND id = ?
+		`, mailbox, id).Scan(&mail, &mailFile, &size, &datetime, &seen, &answered, &flagged, &deleted)
+
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("mail %d not found in %s", id, mailbox)
+		} else if err != nil {
+			return fmt.Errorf("failed to read mail: %w", err)
 		}
 
-		// If fileStore is provided, move the file first
-		if fs != nil {
-			// Get current mail_file path
-			var mailFile sql.NullString
-			err := t.db.QueryRow("SELECT mail_file FROM mails WHERE mailbox = ? AND id = ?", mailbox, id).Scan(&mailFile)
-			if err != nil && err != sql.ErrNoRows {
-				return fmt.Errorf("failed to query mail_file: %w", err)
+		// If fileStore is provided and message has a file, move it to new mailbox directory
+		var newFilePath string
+		if fs != nil && mailFile.Valid && mailFile.String != "" {
+			// Get next ID for destination mailbox to use for file naming
+			var nextID int
+			err := t.db.QueryRow(`
+				SELECT IFNULL(MAX(id)+1,1) AS id FROM mails WHERE mailbox = ?
+			`, destination).Scan(&nextID)
+			if err != nil {
+				return fmt.Errorf("failed to get next ID for destination: %w", err)
 			}
 
-			// If message has a file, move it
-			if mailFile.Valid && mailFile.String != "" {
-				// Move file to new mailbox directory
-				newPath, err := fs.MoveMail(mailFile.String, destination, id)
-				if err != nil {
-					return fmt.Errorf("failed to move mail file: %w", err)
-				}
-
-				// Update mail_file path in database
-				_, err = t.db.Exec("UPDATE mails SET mail_file = ? WHERE mailbox = ? AND id = ?", newPath, mailbox, id)
-				if err != nil {
-					// Try to move file back on error
-					fs.MoveMail(newPath, mailbox, id)
-					return fmt.Errorf("failed to update mail_file path: %w", err)
-				}
+			// Move file to new mailbox directory with new ID
+			newFilePath, err = fs.MoveMail(mailFile.String, destination, nextID)
+			if err != nil {
+				return fmt.Errorf("failed to move mail file: %w", err)
 			}
 		}
 
-		// Update mailbox
-		_, err = t.moveMail.Exec(destination, mailbox, id)
-		return err
+		// Insert mail into destination with new ID (auto-generated as MAX(id)+1)
+		var newID int
+		if mail.Valid && mail.String != "" {
+			// Mail stored in database blob
+			err = t.db.QueryRow(`
+				INSERT INTO mails (mailbox, id, mail, size, datetime, seen, answered, flagged, deleted)
+				VALUES ($1, (SELECT IFNULL(MAX(id)+1,1) FROM mails WHERE mailbox = $1), $2, $3, $4, $5, $6, $7, $8)
+				RETURNING id
+			`, destination, mail.String, size, datetime, seen, answered, flagged, deleted).Scan(&newID)
+		} else if newFilePath != "" {
+			// Mail stored in file
+			err = t.db.QueryRow(`
+				INSERT INTO mails (mailbox, id, mail, mail_file, size, datetime, seen, answered, flagged, deleted)
+				VALUES ($1, (SELECT IFNULL(MAX(id)+1,1) FROM mails WHERE mailbox = $1), NULL, $2, $3, $4, $5, $6, $7, $8)
+				RETURNING id
+			`, destination, newFilePath, size, datetime, seen, answered, flagged, deleted).Scan(&newID)
+		} else {
+			return fmt.Errorf("mail has neither blob nor file content")
+		}
+
+		if err != nil {
+			// Try to move file back on error
+			if newFilePath != "" && fs != nil {
+				fs.MoveMail(newFilePath, mailbox, id)
+			}
+			return fmt.Errorf("failed to insert mail into destination: %w", err)
+		}
+
+		// Delete mail from source
+		_, err = t.db.Exec("DELETE FROM mails WHERE mailbox = ? AND id = ?", mailbox, id)
+		if err != nil {
+			return fmt.Errorf("failed to delete mail from source: %w", err)
+		}
+
+		fmt.Printf("[TableMails] MailMoveWithFileStore: moved mail from %s:%d to %s:%d\n", mailbox, id, destination, newID)
+		return nil
 	})
 }
 
